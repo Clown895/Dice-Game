@@ -315,6 +315,24 @@
                 if (data.playerIndex !== undefined) {
                     currentPlayerIndex = data.playerIndex;
                 }
+            } else if (data.type === 'flash_screen') {
+                // Flash screen from remote player
+                flashActive = true;
+                flashStartTime = Date.now();
+            }
+        }
+        
+        // Flash screen function
+        function triggerFlash() {
+            flashActive = true;
+            flashStartTime = Date.now();
+            
+            // Broadcast flash action in Discord multiplayer (both host and non-host can trigger)
+            if (isDiscordMultiplayer) {
+                broadcastAction({
+                    type: 'flash_screen',
+                    playerIndex: currentPlayerIndex
+                });
             }
         }
         
@@ -499,6 +517,9 @@
         let winner = null;
         let rulesOverlayActive = false;
         let rulesScrollOffset = 0;
+        let flashActive = false;
+        let flashStartTime = 0;
+        const FLASH_DURATION = 1000; // 1 second
         
         // AI state
         let AI_ACTIVE = false;
@@ -2183,6 +2204,12 @@
                 return;
             }
             
+            if (e.key === 'p' || e.key === 'P') {
+                // Flash screen - works even in menu or overlays, and for all players
+                triggerFlash();
+                return;
+            }
+            
             if (turnOverlayActive && e.key) {
                 // Only allow dismissal after minimum duration
                 const currentTime = Date.now();
@@ -2244,6 +2271,13 @@
                 const currentTime = Date.now();
                 const dt = (currentTime - lastTime) / 1000;
                 lastTime = currentTime;
+            
+            // Update flash timing
+            if (flashActive) {
+                if (currentTime - flashStartTime >= FLASH_DURATION) {
+                    flashActive = false;
+                }
+            }
             
             if (!MENU_ACTIVE) {
                 aiUpdate();
@@ -2315,6 +2349,16 @@
                 
                 // Draw fake cursor on top of everything
                 drawFakeCursor(ctx);
+            }
+            
+            // Draw flash overlay on top of everything
+            if (flashActive) {
+                const elapsed = currentTime - flashStartTime;
+                const progress = Math.min(elapsed / FLASH_DURATION, 1);
+                // Fade out over the duration
+                const alpha = 1 - progress;
+                ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+                ctx.fillRect(0, 0, width, height);
             }
             
             requestAnimationFrame(gameLoop);
