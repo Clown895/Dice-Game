@@ -29,7 +29,7 @@
         // Replace with your Discord Application Client ID
         // Get this from https://discord.com/developers/applications
         // Create a new application, then copy the Client ID from the OAuth2 section
-        const DISCORD_CLIENT_ID = "YOUR_CLIENT_ID_HERE";
+        const DISCORD_CLIENT_ID = "1438550438583468082";
         
         // Detect if running in Discord
         function isRunningInDiscord() {
@@ -91,6 +91,9 @@
                 discordUser = authResult.user;
                 console.log('Discord user authenticated:', discordUser);
                 
+                // Get Discord username (user can still edit it in the menu)
+                const discordUsername = discordUser.username || discordUser.global_name || 'Player';
+                
                 // Try to create or join a lobby
                 try {
                     // Try to create a new lobby first
@@ -100,11 +103,24 @@
                     });
                     isHost = true;
                     console.log('Created lobby:', discordLobby.id);
+                    
+                    // Host is player 1 - set their username if field is empty
+                    if (!MENU_INPUT_FIELDS.player1) {
+                        MENU_INPUT_FIELDS.player1 = discordUsername;
+                    }
                 } catch (createError) {
                     // If creation fails, try to join an existing lobby
                     console.log('Could not create lobby, attempting to join...');
-                    // Note: You might need to implement lobby discovery/joining logic here
-                    // For now, we'll assume the host creates the lobby
+                    isHost = false;
+                    
+                    // Non-host is player 2 - set their username if field is empty
+                    if (!MENU_INPUT_FIELDS.player2) {
+                        MENU_INPUT_FIELDS.player2 = discordUsername;
+                    }
+                    
+                    // Try to get lobby members to find the other player
+                    // Note: This might not work if we haven't joined a lobby yet
+                    // The lobby update event will handle this
                 }
                 
                 // Connect to lobby voice channel (optional)
@@ -129,6 +145,106 @@
                         console.error("Error parsing Discord message:", error);
                     }
                 });
+                
+                // Listen for lobby updates (when players join/leave)
+                discordSdk.subscribe("LOBBY_UPDATE", async (update) => {
+                    try {
+                        console.log("Lobby updated:", update);
+                        // Try to get updated lobby members
+                        if (discordLobby) {
+                            const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                                lobby_id: discordLobby.id
+                            });
+                            if (lobbyMembers && lobbyMembers.length > 0) {
+                                // Find ourselves and the other player
+                                const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                                const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                                
+                                // Set our own name
+                                if (ourMember && ourMember.user) {
+                                    const ourUsername = ourMember.user.username || ourMember.user.global_name || 'Player';
+                                    if (isHost) {
+                                        // Host is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = ourUsername;
+                                        }
+                                    } else {
+                                        // Non-host is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = ourUsername;
+                                        }
+                                    }
+                                }
+                                
+                                // Set the other player's name
+                                if (otherMember && otherMember.user) {
+                                    const otherUsername = otherMember.user.username || otherMember.user.global_name || 'Player';
+                                    if (isHost) {
+                                        // If we're host, other player is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = otherUsername;
+                                        }
+                                    } else {
+                                        // If we're not host, other player is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = otherUsername;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error("Error handling lobby update:", error);
+                    }
+                });
+                
+                // After connecting, try to get lobby members
+                if (discordLobby) {
+                    try {
+                        const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                            lobby_id: discordLobby.id
+                        });
+                        if (lobbyMembers && lobbyMembers.length > 0) {
+                            // Find ourselves and the other player
+                            const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                            const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                            
+                            // Set our own name
+                            if (ourMember && ourMember.user) {
+                                const ourUsername = ourMember.user.username || ourMember.user.global_name || 'Player';
+                                if (isHost) {
+                                    // Host is player 1
+                                    if (!MENU_INPUT_FIELDS.player1) {
+                                        MENU_INPUT_FIELDS.player1 = ourUsername;
+                                    }
+                                } else {
+                                    // Non-host is player 2
+                                    if (!MENU_INPUT_FIELDS.player2) {
+                                        MENU_INPUT_FIELDS.player2 = ourUsername;
+                                    }
+                                }
+                            }
+                            
+                            // Set the other player's name if they're in the lobby
+                            if (otherMember && otherMember.user) {
+                                const otherUsername = otherMember.user.username || otherMember.user.global_name || 'Player';
+                                if (isHost) {
+                                    // If we're host, other player is player 2
+                                    if (!MENU_INPUT_FIELDS.player2) {
+                                        MENU_INPUT_FIELDS.player2 = otherUsername;
+                                    }
+                                } else {
+                                    // If we're not host, other player is player 1
+                                    if (!MENU_INPUT_FIELDS.player1) {
+                                        MENU_INPUT_FIELDS.player1 = otherUsername;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (memberError) {
+                        console.log('Could not get initial lobby members:', memberError);
+                    }
+                }
                 
                 isDiscordMultiplayer = true;
                 return true;
