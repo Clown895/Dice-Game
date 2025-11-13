@@ -24,7 +24,369 @@
 </head>
 <body>
     <canvas id="gameCanvas" tabindex="0"></canvas>
-    <script>
+    <script type="module">
+        // ==================== DISCORD INTEGRATION ====================
+        // Replace with your Discord Application Client ID
+        // Get this from https://discord.com/developers/applications
+        // Create a new application, then copy the Client ID from the OAuth2 section
+        const DISCORD_CLIENT_ID = "1438550438583468082";
+        
+        // Detect if running in Discord
+        function isRunningInDiscord() {
+            // Check for Discord's iframe context
+            try {
+                return window.parent !== window && 
+                       (window.location !== window.parent.location || 
+                        window.self !== window.top ||
+                        document.referrer.includes('discord.com') ||
+                        window.location.search.includes('discord'));
+            } catch (e) {
+                // Cross-origin error means we're likely in an iframe (possibly Discord)
+                return true;
+            }
+        }
+        
+        let discordSdk = null;
+        let discordUser = null;
+        let discordLobby = null;
+        let isDiscordMultiplayer = false;
+        let isHost = false;
+        let remotePlayerId = null;
+        
+        // Initialize Discord SDK
+        async function initDiscord() {
+            if (!isRunningInDiscord()) {
+                console.log('Not running in Discord, skipping Discord SDK initialization');
+                return false;
+            }
+            
+            try {
+                // Import Discord SDK dynamically
+                // Note: You may need to bundle the SDK or use a CDN that provides it as ES module
+                // For now, we'll try to import it - if it fails, the game will work without Discord
+                let DiscordSDK;
+                try {
+                    const module = await import('https://unpkg.com/@discord/embedded-app-sdk@latest/dist/index.esm.js');
+                    DiscordSDK = module.DiscordSDK || module.default?.DiscordSDK;
+                } catch (importError) {
+                    // Try alternative import path
+                    try {
+                        const module = await import('https://cdn.jsdelivr.net/npm/@discord/embedded-app-sdk@latest/dist/index.esm.js');
+                        DiscordSDK = module.DiscordSDK || module.default?.DiscordSDK;
+                    } catch (altError) {
+                        console.error('Could not load Discord SDK:', altError);
+                        throw new Error('Discord SDK not available');
+                    }
+                }
+                
+                if (!DiscordSDK) {
+                    throw new Error('DiscordSDK not found in module');
+                }
+                
+                discordSdk = new DiscordSDK(DISCORD_CLIENT_ID);
+                await discordSdk.ready();
+                
+                // Authenticate user
+                const authResult = await discordSdk.commands.authenticate();
+                discordUser = authResult.user;
+                console.log('Discord user authenticated:', discordUser);
+                
+                // Get Discord username (user can still edit it in the menu)
+                const discordUsername = discordUser.username || discordUser.global_name || 'Player';
+                
+                // Try to create or join a lobby
+                try {
+                    // Try to create a new lobby first
+                    discordLobby = await discordSdk.commands.createLobby({
+                        capacity: 2,
+                        type: "PRIVATE",
+                    });
+                    isHost = true;
+                    console.log('Created lobby:', discordLobby.id);
+                    
+                    // Host is player 1 - set their username if field is empty
+                    if (!MENU_INPUT_FIELDS.player1) {
+                        MENU_INPUT_FIELDS.player1 = discordUsername;
+                    }
+                } catch (createError) {
+                    // If creation fails, try to join an existing lobby
+                    console.log('Could not create lobby, attempting to join...');
+                    isHost = false;
+                    
+                    // Non-host is player 2 - set their username if field is empty
+                    if (!MENU_INPUT_FIELDS.player2) {
+                        MENU_INPUT_FIELDS.player2 = discordUsername;
+                    }
+                    
+                    // Try to get lobby members to find the other player
+                    // Note: This might not work if we haven't joined a lobby yet
+                    // The lobby update event will handle this
+                }
+                
+                // Connect to lobby voice channel (optional)
+                if (discordLobby) {
+                    try {
+                        await discordSdk.commands.connectToLobby({
+                            lobby_id: discordLobby.id
+                        });
+                        console.log('Connected to lobby voice channel');
+                    } catch (voiceError) {
+                        console.log('Could not connect to voice channel:', voiceError);
+                    }
+                }
+                
+                // Listen for messages from other players
+                discordSdk.subscribe("LOBBY_MESSAGE", ({ payload }) => {
+                    try {
+                        const data = JSON.parse(payload.payload);
+                        console.log("Received from Discord:", data);
+                        handleRemoteAction(data);
+                    } catch (error) {
+                        console.error("Error parsing Discord message:", error);
+                    }
+                });
+                
+                // Listen for lobby updates (when players join/leave)
+                discordSdk.subscribe("LOBBY_UPDATE", async (update) => {
+                    try {
+                        console.log("Lobby updated:", update);
+                        // Try to get updated lobby members
+                        if (discordLobby) {
+                            const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                                lobby_id: discordLobby.id
+                            });
+                            if (lobbyMembers && lobbyMembers.length > 0) {
+                                // Find ourselves and the other player
+                                const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                                const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                                
+                                // Set our own name
+                                if (ourMember && ourMember.user) {
+                                    const ourUsername = ourMember.user.username || ourMember.user.global_name || 'Player';
+                                    if (isHost) {
+                                        // Host is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = ourUsername;
+                                        }
+                                    } else {
+                                        // Non-host is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = ourUsername;
+                                        }
+                                    }
+                                }
+                                
+                                // Set the other player's name
+                                if (otherMember && otherMember.user) {
+                                    const otherUsername = otherMember.user.username || otherMember.user.global_name || 'Player';
+                                    if (isHost) {
+                                        // If we're host, other player is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = otherUsername;
+                                        }
+                                    } else {
+                                        // If we're not host, other player is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = otherUsername;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error("Error handling lobby update:", error);
+                    }
+                });
+                
+                // After connecting, try to get lobby members
+                if (discordLobby) {
+                    try {
+                        const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                            lobby_id: discordLobby.id
+                        });
+                        if (lobbyMembers && lobbyMembers.length > 0) {
+                            // Find ourselves and the other player
+                            const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                            const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                            
+                            // Set our own name
+                            if (ourMember && ourMember.user) {
+                                const ourUsername = ourMember.user.username || ourMember.user.global_name || 'Player';
+                                if (isHost) {
+                                    // Host is player 1
+                                    if (!MENU_INPUT_FIELDS.player1) {
+                                        MENU_INPUT_FIELDS.player1 = ourUsername;
+                                    }
+                                } else {
+                                    // Non-host is player 2
+                                    if (!MENU_INPUT_FIELDS.player2) {
+                                        MENU_INPUT_FIELDS.player2 = ourUsername;
+                                    }
+                                }
+                            }
+                            
+                            // Set the other player's name if they're in the lobby
+                            if (otherMember && otherMember.user) {
+                                const otherUsername = otherMember.user.username || otherMember.user.global_name || 'Player';
+                                if (isHost) {
+                                    // If we're host, other player is player 2
+                                    if (!MENU_INPUT_FIELDS.player2) {
+                                        MENU_INPUT_FIELDS.player2 = otherUsername;
+                                    }
+                                } else {
+                                    // If we're not host, other player is player 1
+                                    if (!MENU_INPUT_FIELDS.player1) {
+                                        MENU_INPUT_FIELDS.player1 = otherUsername;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (memberError) {
+                        console.log('Could not get initial lobby members:', memberError);
+                    }
+                }
+                
+                isDiscordMultiplayer = true;
+                return true;
+            } catch (error) {
+                console.error("Discord SDK initialization failed:", error);
+                return false;
+            }
+        }
+        
+        // Broadcast game action to other players
+        function broadcastAction(action) {
+            if (!isDiscordMultiplayer || !discordLobby || !discordSdk) {
+                return;
+            }
+            
+            try {
+                discordSdk.commands.sendLobbyMessage({
+                    lobby_id: discordLobby.id,
+                    payload: JSON.stringify(action),
+                });
+                console.log("Broadcasted action:", action);
+            } catch (error) {
+                console.error("Error broadcasting action:", error);
+            }
+        }
+        
+        // Handle actions received from remote players
+        function handleRemoteAction(data) {
+            if (!isDiscordMultiplayer) return;
+            
+            // Only process actions if we're not the host or if it's a state sync
+            if (data.type === 'dice_roll') {
+                // Remote player rolled dice
+                if (!isHost && diceRow && diceRow.length > 0) {
+                    // Update dice values from remote
+                    for (let i = 0; i < Math.min(diceRow.length, data.diceValues.length); i++) {
+                        diceRow[i].value = data.diceValues[i];
+                        diceRow[i].selected = false;
+                    }
+                    updateSelectedScore();
+                }
+            } else if (data.type === 'dice_select') {
+                // Remote player selected/deselected a die
+                if (!isHost && diceRow && diceRow[data.diceIndex] !== undefined) {
+                    diceRow[data.diceIndex].selected = data.selected;
+                    updateSelectedScore();
+                }
+            } else if (data.type === 'bank_dice') {
+                // Remote player banked dice
+                if (!isHost) {
+                    const selectedDice = diceRow.filter(d => d.selected);
+                    if (selectedDice.length > 0) {
+                        bankSelectedDice();
+                    }
+                }
+            } else if (data.type === 'bank_and_pass') {
+                // Remote player banked and passed
+                if (!isHost) {
+                    bankAndPassTurn();
+                }
+            } else if (data.type === 'game_state') {
+                // Full game state sync (from host)
+                if (!isHost) {
+                    syncGameState(data.state);
+                }
+            } else if (data.type === 'player_turn') {
+                // Turn change notification
+                if (data.playerIndex !== undefined) {
+                    currentPlayerIndex = data.playerIndex;
+                }
+            } else if (data.type === 'flash_screen') {
+                // Flash screen from remote player
+                flashActive = true;
+                flashStartTime = Date.now();
+            }
+        }
+        
+        // Flash screen function
+        function triggerFlash() {
+            flashActive = true;
+            flashStartTime = Date.now();
+            
+            // Broadcast flash action in Discord multiplayer (both host and non-host can trigger)
+            if (isDiscordMultiplayer) {
+                broadcastAction({
+                    type: 'flash_screen',
+                    playerIndex: currentPlayerIndex
+                });
+            }
+        }
+        
+        // Sync full game state (for joining mid-game)
+        function syncGameState(state) {
+            PLAYERS = state.players || PLAYERS;
+            PLAYER_GOAL = state.goal || PLAYER_GOAL;
+            currentPlayerIndex = state.currentPlayerIndex || 0;
+            playerStats = state.playerStats || playerStats;
+            playerBankedGroups = state.playerBankedGroups || playerBankedGroups;
+            
+            // Sync dice
+            if (state.diceValues && state.diceValues.length > 0) {
+                if (diceRow.length !== state.diceValues.length) {
+                    resetDiceRow(state.diceValues.length);
+                }
+                for (let i = 0; i < diceRow.length; i++) {
+                    diceRow[i].value = state.diceValues[i];
+                    diceRow[i].selected = state.diceSelected ? state.diceSelected[i] : false;
+                }
+                updateSelectedScore();
+            }
+        }
+        
+        // Get current game state for broadcasting
+        function getGameState() {
+            return {
+                players: PLAYERS,
+                goal: PLAYER_GOAL,
+                currentPlayerIndex: currentPlayerIndex,
+                playerStats: JSON.parse(JSON.stringify(playerStats)), // Deep copy
+                playerBankedGroups: JSON.parse(JSON.stringify(playerBankedGroups)), // Deep copy
+                diceValues: diceRow.map(d => d.value),
+                diceSelected: diceRow.map(d => d.selected)
+            };
+        }
+        
+        // Broadcast full game state
+        function broadcastGameState() {
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'game_state',
+                    state: getGameState()
+                });
+            }
+        }
+        
+        // Initialize Discord on page load
+        initDiscord().then(success => {
+            if (success) {
+                console.log('Discord multiplayer enabled!');
+            }
+        });
+        
         // ==================== GAME CONSTANTS ====================
         const DICE_COUNT = 6;
         const DICE_SIZE = 100;
@@ -155,6 +517,9 @@
         let winner = null;
         let rulesOverlayActive = false;
         let rulesScrollOffset = 0;
+        let flashActive = false;
+        let flashStartTime = 0;
+        const FLASH_DURATION = 1000; // 1 second
         
         // AI state
         let AI_ACTIVE = false;
@@ -706,6 +1071,15 @@
                 dice.isHovered = false;
             }
             testInputValues = diceRow.map(d => d.value);
+            
+            // Broadcast dice roll in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'dice_roll',
+                    diceValues: diceRow.map(d => d.value),
+                    playerIndex: currentPlayerIndex
+                });
+            }
         }
         
         function startNextPlayerTurn() {
@@ -717,6 +1091,14 @@
             resetDiceRow(DICE_COUNT);
             updateSelectedScore();
             checkForBust();
+            
+            // Broadcast turn change in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'player_turn',
+                    playerIndex: currentPlayerIndex
+                });
+            }
             
             AI_THINKING = false;
             AI_ACTION_QUEUE = [];
@@ -776,6 +1158,14 @@
             
             updateSelectedScore();
             checkForBust();
+            
+            // Broadcast bank action in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'bank_dice',
+                    playerIndex: currentPlayerIndex
+                });
+            }
         }
         
         function bankAndPassTurn() {
@@ -813,6 +1203,14 @@
                 winner = currentPlayer;
                 startCelebration();
                 return;
+            }
+            
+            // Broadcast bank and pass action in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'bank_and_pass',
+                    playerIndex: currentPlayerIndex
+                });
             }
             
             // Pass to next player
@@ -1713,6 +2111,13 @@
             turnOverlayActive = true;
             turnOverlayStartTime = Date.now();
             MENU_ACTIVE = false;
+            
+            // Broadcast initial game state in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                setTimeout(() => {
+                    broadcastGameState();
+                }, 100); // Small delay to ensure everything is initialized
+            }
         }
         
         // ==================== INPUT HANDLING ====================
@@ -1728,14 +2133,31 @@
             
             if (turnOverlayActive || bustOverlayActive || gameWon) return;
             
+            // In Discord multiplayer, only host can act (for now)
+            // TODO: Improve to allow both players to act on their turn
+            if (isDiscordMultiplayer && !isHost) {
+                return; // Non-host players can only observe in current implementation
+            }
+            
             const aiShouldControl = (currentPlayerIndex === 1 && MENU_PLAYER2_AI_ENABLED &&
                 !turnOverlayActive && !bustOverlayActive && !gameWon && !testInputActive);
             if (aiShouldControl) return;
             
-            for (const dice of diceRow) {
+            for (let i = 0; i < diceRow.length; i++) {
+                const dice = diceRow[i];
                 if (dice.containsPoint([x, y])) {
                     dice.selected = !dice.selected;
                     updateSelectedScore();
+                    
+                    // Broadcast dice selection in Discord multiplayer
+                    if (isDiscordMultiplayer && isHost) {
+                        broadcastAction({
+                            type: 'dice_select',
+                            diceIndex: i,
+                            selected: dice.selected,
+                            playerIndex: currentPlayerIndex
+                        });
+                    }
                     break;
                 }
             }
@@ -1782,6 +2204,12 @@
                 return;
             }
             
+            if (e.key === 'p' || e.key === 'P') {
+                // Flash screen - works even in menu or overlays, and for all players
+                triggerFlash();
+                return;
+            }
+            
             if (turnOverlayActive && e.key) {
                 // Only allow dismissal after minimum duration
                 const currentTime = Date.now();
@@ -1799,6 +2227,11 @@
             }
             
             if (turnOverlayActive || bustOverlayActive || gameWon) return;
+            
+            // In Discord multiplayer, only host can act (for now)
+            if (isDiscordMultiplayer && !isHost) {
+                return; // Non-host players can only observe in current implementation
+            }
             
             const aiShouldControl = (currentPlayerIndex === 1 && MENU_PLAYER2_AI_ENABLED &&
                 !turnOverlayActive && !bustOverlayActive && !gameWon && !testInputActive);
@@ -1838,6 +2271,13 @@
                 const currentTime = Date.now();
                 const dt = (currentTime - lastTime) / 1000;
                 lastTime = currentTime;
+            
+            // Update flash timing
+            if (flashActive) {
+                if (currentTime - flashStartTime >= FLASH_DURATION) {
+                    flashActive = false;
+                }
+            }
             
             if (!MENU_ACTIVE) {
                 aiUpdate();
@@ -1911,6 +2351,16 @@
                 drawFakeCursor(ctx);
             }
             
+            // Draw flash overlay on top of everything
+            if (flashActive) {
+                const elapsed = currentTime - flashStartTime;
+                const progress = Math.min(elapsed / FLASH_DURATION, 1);
+                // Fade out over the duration
+                const alpha = 1 - progress;
+                ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+                ctx.fillRect(0, 0, width, height);
+            }
+            
             requestAnimationFrame(gameLoop);
             } catch (error) {
                 console.error('Game loop error:', error);
@@ -1928,3 +2378,4 @@
     </script>
 </body>
 </html>
+
