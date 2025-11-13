@@ -1,0 +1,2391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KCD Dice Game</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+            cursor: default;
+            outline: none;
+        }
+        canvas.ai-active {
+            cursor: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" tabindex="0"></canvas>
+    <script type="module">
+        // ==================== DISCORD INTEGRATION ====================
+        // Replace with your Discord Application Client ID
+        // Get this from https://discord.com/developers/applications
+        // Create a new application, then copy the Client ID from the OAuth2 section
+        const DISCORD_CLIENT_ID = "1438550438583468082";
+        
+        // Detect if running in Discord
+        function isRunningInDiscord() {
+            // Check for Discord's iframe context
+            try {
+                return window.parent !== window && 
+                       (window.location !== window.parent.location || 
+                        window.self !== window.top ||
+                        document.referrer.includes('discord.com') ||
+                        window.location.search.includes('discord'));
+            } catch (e) {
+                // Cross-origin error means we're likely in an iframe (possibly Discord)
+                return true;
+            }
+        }
+        
+        let discordSdk = null;
+        let discordUser = null;
+        let discordLobby = null;
+        let isDiscordMultiplayer = false;
+        let isHost = false;
+        let remotePlayerId = null;
+        
+        // Initialize Discord SDK
+        async function initDiscord() {
+            if (!isRunningInDiscord()) {
+                console.log('Not running in Discord, skipping Discord SDK initialization');
+                return false;
+            }
+            
+            try {
+                // Import Discord SDK dynamically
+                // Note: You may need to bundle the SDK or use a CDN that provides it as ES module
+                // For now, we'll try to import it - if it fails, the game will work without Discord
+                let DiscordSDK;
+                try {
+                    const module = await import('https://unpkg.com/@discord/embedded-app-sdk@latest/dist/index.esm.js');
+                    DiscordSDK = module.DiscordSDK || module.default?.DiscordSDK;
+                } catch (importError) {
+                    // Try alternative import path
+                    try {
+                        const module = await import('https://cdn.jsdelivr.net/npm/@discord/embedded-app-sdk@latest/dist/index.esm.js');
+                        DiscordSDK = module.DiscordSDK || module.default?.DiscordSDK;
+                    } catch (altError) {
+                        console.error('Could not load Discord SDK:', altError);
+                        throw new Error('Discord SDK not available');
+                    }
+                }
+                
+                if (!DiscordSDK) {
+                    throw new Error('DiscordSDK not found in module');
+                }
+                
+                discordSdk = new DiscordSDK(DISCORD_CLIENT_ID);
+                await discordSdk.ready();
+                
+                // Authenticate user
+                const authResult = await discordSdk.commands.authenticate();
+                discordUser = authResult.user;
+                console.log('Discord user authenticated:', discordUser);
+                
+                // Get Discord username (user can still edit it in the menu)
+                const discordUsername = discordUser.username || discordUser.global_name || discordUser.display_name || 'Player';
+                console.log('Discord username extracted:', discordUsername);
+                
+                // Try to create or join a lobby
+                try {
+                    // Try to create a new lobby first
+                    discordLobby = await discordSdk.commands.createLobby({
+                        capacity: 2,
+                        type: "PRIVATE",
+                    });
+                    isHost = true;
+                    console.log('Created lobby:', discordLobby.id);
+                    
+                    // Host is player 1 - set their username (overwrite if empty or default)
+                    if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '' || MENU_INPUT_FIELDS.player1 === '...') {
+                        MENU_INPUT_FIELDS.player1 = discordUsername;
+                        console.log('Set player1 to:', discordUsername);
+                    }
+                } catch (createError) {
+                    // If creation fails, try to join an existing lobby
+                    console.log('Could not create lobby, attempting to join...', createError);
+                    isHost = false;
+                    
+                    // Non-host is player 2 - set their username (overwrite if empty or default)
+                    if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '' || MENU_INPUT_FIELDS.player2 === '...') {
+                        MENU_INPUT_FIELDS.player2 = discordUsername;
+                        console.log('Set player2 to:', discordUsername);
+                    }
+                    
+                    // Try to get lobby members to find the other player
+                    // Note: This might not work if we haven't joined a lobby yet
+                    // The lobby update event will handle this
+                }
+                
+                // Connect to lobby voice channel (optional)
+                if (discordLobby) {
+                    try {
+                        await discordSdk.commands.connectToLobby({
+                            lobby_id: discordLobby.id
+                        });
+                        console.log('Connected to lobby voice channel');
+                    } catch (voiceError) {
+                        console.log('Could not connect to voice channel:', voiceError);
+                    }
+                }
+                
+                // Listen for messages from other players
+                discordSdk.subscribe("LOBBY_MESSAGE", ({ payload }) => {
+                    try {
+                        const data = JSON.parse(payload.payload);
+                        console.log("Received from Discord:", data);
+                        handleRemoteAction(data);
+                    } catch (error) {
+                        console.error("Error parsing Discord message:", error);
+                    }
+                });
+                
+                // Listen for lobby updates (when players join/leave)
+                discordSdk.subscribe("LOBBY_UPDATE", async (update) => {
+                    try {
+                        console.log("Lobby updated:", update);
+                        // Try to get updated lobby members
+                        if (discordLobby) {
+                            const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                                lobby_id: discordLobby.id
+                            });
+                            if (lobbyMembers && lobbyMembers.length > 0) {
+                                // Find ourselves and the other player
+                                const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                                const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                                
+                                // Set our own name
+                                if (ourMember && ourMember.user) {
+                                    const ourUsername = ourMember.user.username || ourMember.user.global_name || ourMember.user.display_name || 'Player';
+                                    if (isHost) {
+                                        // Host is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '' || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = ourUsername;
+                                            console.log('Updated player1 from lobby update to:', ourUsername);
+                                        }
+                                    } else {
+                                        // Non-host is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '' || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = ourUsername;
+                                            console.log('Updated player2 from lobby update to:', ourUsername);
+                                        }
+                                    }
+                                }
+                                
+                                // Set the other player's name
+                                if (otherMember && otherMember.user) {
+                                    const otherUsername = otherMember.user.username || otherMember.user.global_name || otherMember.user.display_name || 'Player';
+                                    if (isHost) {
+                                        // If we're host, other player is player 2
+                                        if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '' || MENU_INPUT_FIELDS.player2 === '...') {
+                                            MENU_INPUT_FIELDS.player2 = otherUsername;
+                                            console.log('Updated player2 (other player) from lobby update to:', otherUsername);
+                                        }
+                                    } else {
+                                        // If we're not host, other player is player 1
+                                        if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '' || MENU_INPUT_FIELDS.player1 === '...') {
+                                            MENU_INPUT_FIELDS.player1 = otherUsername;
+                                            console.log('Updated player1 (other player) from lobby update to:', otherUsername);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        console.error("Error handling lobby update:", error);
+                    }
+                });
+                
+                // After connecting, try to get lobby members
+                if (discordLobby) {
+                    try {
+                        const lobbyMembers = await discordSdk.commands.getLobbyMembers({
+                            lobby_id: discordLobby.id
+                        });
+                        if (lobbyMembers && lobbyMembers.length > 0) {
+                            // Find ourselves and the other player
+                            const ourMember = lobbyMembers.find(m => m.user.id === discordUser.id);
+                            const otherMember = lobbyMembers.find(m => m.user.id !== discordUser.id);
+                            
+                            // Set our own name
+                            if (ourMember && ourMember.user) {
+                                const ourUsername = ourMember.user.username || ourMember.user.global_name || ourMember.user.display_name || 'Player';
+                                if (isHost) {
+                                    // Host is player 1
+                                    if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '' || MENU_INPUT_FIELDS.player1 === '...') {
+                                        MENU_INPUT_FIELDS.player1 = ourUsername;
+                                        console.log('Updated player1 from lobby members to:', ourUsername);
+                                    }
+                                } else {
+                                    // Non-host is player 2
+                                    if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '' || MENU_INPUT_FIELDS.player2 === '...') {
+                                        MENU_INPUT_FIELDS.player2 = ourUsername;
+                                        console.log('Updated player2 from lobby members to:', ourUsername);
+                                    }
+                                }
+                            }
+                            
+                            // Set the other player's name if they're in the lobby
+                            if (otherMember && otherMember.user) {
+                                const otherUsername = otherMember.user.username || otherMember.user.global_name || otherMember.user.display_name || 'Player';
+                                if (isHost) {
+                                    // If we're host, other player is player 2
+                                    if (!MENU_INPUT_FIELDS.player2 || MENU_INPUT_FIELDS.player2 === '' || MENU_INPUT_FIELDS.player2 === '...') {
+                                        MENU_INPUT_FIELDS.player2 = otherUsername;
+                                        console.log('Updated player2 (other player) from lobby members to:', otherUsername);
+                                    }
+                                } else {
+                                    // If we're not host, other player is player 1
+                                    if (!MENU_INPUT_FIELDS.player1 || MENU_INPUT_FIELDS.player1 === '' || MENU_INPUT_FIELDS.player1 === '...') {
+                                        MENU_INPUT_FIELDS.player1 = otherUsername;
+                                        console.log('Updated player1 (other player) from lobby members to:', otherUsername);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (memberError) {
+                        console.log('Could not get initial lobby members:', memberError);
+                    }
+                }
+                
+                isDiscordMultiplayer = true;
+                return true;
+            } catch (error) {
+                console.error("Discord SDK initialization failed:", error);
+                return false;
+            }
+        }
+        
+        // Broadcast game action to other players
+        function broadcastAction(action) {
+            if (!isDiscordMultiplayer || !discordLobby || !discordSdk) {
+                return;
+            }
+            
+            try {
+                discordSdk.commands.sendLobbyMessage({
+                    lobby_id: discordLobby.id,
+                    payload: JSON.stringify(action),
+                });
+                console.log("Broadcasted action:", action);
+            } catch (error) {
+                console.error("Error broadcasting action:", error);
+            }
+        }
+        
+        // Handle actions received from remote players
+        function handleRemoteAction(data) {
+            if (!isDiscordMultiplayer) return;
+            
+            // Only process actions if we're not the host or if it's a state sync
+            if (data.type === 'dice_roll') {
+                // Remote player rolled dice
+                if (!isHost && diceRow && diceRow.length > 0) {
+                    // Update dice values from remote
+                    for (let i = 0; i < Math.min(diceRow.length, data.diceValues.length); i++) {
+                        diceRow[i].value = data.diceValues[i];
+                        diceRow[i].selected = false;
+                    }
+                    updateSelectedScore();
+                }
+            } else if (data.type === 'dice_select') {
+                // Remote player selected/deselected a die
+                if (!isHost && diceRow && diceRow[data.diceIndex] !== undefined) {
+                    diceRow[data.diceIndex].selected = data.selected;
+                    updateSelectedScore();
+                }
+            } else if (data.type === 'bank_dice') {
+                // Remote player banked dice
+                if (!isHost) {
+                    const selectedDice = diceRow.filter(d => d.selected);
+                    if (selectedDice.length > 0) {
+                        bankSelectedDice();
+                    }
+                }
+            } else if (data.type === 'bank_and_pass') {
+                // Remote player banked and passed
+                if (!isHost) {
+                    bankAndPassTurn();
+                }
+            } else if (data.type === 'game_state') {
+                // Full game state sync (from host)
+                if (!isHost) {
+                    syncGameState(data.state);
+                }
+            } else if (data.type === 'player_turn') {
+                // Turn change notification
+                if (data.playerIndex !== undefined) {
+                    currentPlayerIndex = data.playerIndex;
+                }
+            } else if (data.type === 'flash_screen') {
+                // Flash screen from remote player
+                flashActive = true;
+                flashStartTime = Date.now();
+            }
+        }
+        
+        // Flash screen function
+        function triggerFlash() {
+            flashActive = true;
+            flashStartTime = Date.now();
+            
+            // Broadcast flash action in Discord multiplayer (both host and non-host can trigger)
+            if (isDiscordMultiplayer) {
+                broadcastAction({
+                    type: 'flash_screen',
+                    playerIndex: currentPlayerIndex
+                });
+            }
+        }
+        
+        // Sync full game state (for joining mid-game)
+        function syncGameState(state) {
+            PLAYERS = state.players || PLAYERS;
+            PLAYER_GOAL = state.goal || PLAYER_GOAL;
+            currentPlayerIndex = state.currentPlayerIndex || 0;
+            playerStats = state.playerStats || playerStats;
+            playerBankedGroups = state.playerBankedGroups || playerBankedGroups;
+            
+            // Sync dice
+            if (state.diceValues && state.diceValues.length > 0) {
+                if (diceRow.length !== state.diceValues.length) {
+                    resetDiceRow(state.diceValues.length);
+                }
+                for (let i = 0; i < diceRow.length; i++) {
+                    diceRow[i].value = state.diceValues[i];
+                    diceRow[i].selected = state.diceSelected ? state.diceSelected[i] : false;
+                }
+                updateSelectedScore();
+            }
+        }
+        
+        // Get current game state for broadcasting
+        function getGameState() {
+            return {
+                players: PLAYERS,
+                goal: PLAYER_GOAL,
+                currentPlayerIndex: currentPlayerIndex,
+                playerStats: JSON.parse(JSON.stringify(playerStats)), // Deep copy
+                playerBankedGroups: JSON.parse(JSON.stringify(playerBankedGroups)), // Deep copy
+                diceValues: diceRow.map(d => d.value),
+                diceSelected: diceRow.map(d => d.selected)
+            };
+        }
+        
+        // Broadcast full game state
+        function broadcastGameState() {
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'game_state',
+                    state: getGameState()
+                });
+            }
+        }
+        
+        // Initialize Discord on page load
+        initDiscord().then(success => {
+            if (success) {
+                console.log('Discord multiplayer enabled!');
+            }
+        });
+        
+        // ==================== GAME CONSTANTS ====================
+        const DICE_COUNT = 6;
+        const DICE_SIZE = 100;
+        const DICE_OUTLINE_WIDTH = 5;
+        const DICE_COLOR = [0, 0, 0];
+        const DICE_OUTLINE_COLOR = [255, 255, 255];
+        const DICE_PIP_COLOR = [255, 255, 255];
+        const DICE_PIP_RADIUS = 10;
+        const DICE_HOVER_OUTLINE_COLOR = [255, 215, 0];
+        const DICE_SELECTED_COLOR = [212, 175, 55];
+        
+        const PIP_MAP = {
+            1: [[0.5, 0.5]],
+            2: [[0.25, 0.25], [0.75, 0.75]],
+            3: [[0.25, 0.25], [0.5, 0.5], [0.75, 0.75]],
+            4: [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]],
+            5: [[0.25, 0.25], [0.75, 0.25], [0.5, 0.5], [0.25, 0.75], [0.75, 0.75]],
+            6: [[0.25, 0.25], [0.75, 0.25], [0.25, 0.5], [0.75, 0.5], [0.25, 0.75], [0.75, 0.75]]
+        };
+        
+        const SCOREBOARD_MARGIN_X = 40;
+        let SCOREBOARD_TOP = 0; // Will be set in resizeCanvas
+        const SCOREBOARD_ROW_GAP = 40;
+        const SCOREBOARD_COLUMN_WIDTH = 140;
+        const SCOREBOARD_COLUMN_GAP = 20;
+        const BANKED_DICE_SCALE = 0.5;
+        const BANKED_DICE_GAP = 10;
+        const BANKED_DICE_MARGIN_TOP = 20;
+        const HOLD_DURATION = 1000;
+        const TURN_OVERLAY_DURATION = 2000;
+        const TURN_OVERLAY_MIN_DURATION = 500; // Minimum time before keys can dismiss it
+        const BUST_OVERLAY_DURATION = 3000;
+        
+        const AI_DECISION_DELAY = 500;
+        const AI_MOUSE_MOVE_SPEED = 5;
+        const AI_CLICK_DELAY = 200;
+        const AI_BANK_AND_PASS_DELAY = 300;
+        
+        // ==================== CANVAS SETUP ====================
+        const canvas = document.getElementById('gameCanvas');
+        if (!canvas) {
+            console.error('Canvas element not found!');
+        }
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            console.error('Could not get 2d context!');
+        }
+        let width = 2560;
+        let height = 1440;
+        
+        // Base resolution for scaling (16:9 aspect ratio)
+        const BASE_WIDTH = 1920;
+        const BASE_HEIGHT = 1080;
+        
+        // Scaling functions
+        function getScale() {
+            // Scale based on the smaller dimension to ensure everything fits
+            const scaleX = width / BASE_WIDTH;
+            const scaleY = height / BASE_HEIGHT;
+            return Math.min(scaleX, scaleY);
+        }
+        
+        function scaleFont(baseSize) {
+            return Math.max(12, Math.floor(baseSize * getScale()));
+        }
+        
+        function scaleValue(baseValue) {
+            return baseValue * getScale();
+        }
+        
+        // Set canvas size
+        function resizeCanvas() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            SCOREBOARD_TOP = Math.floor(height * 0.15);
+            // Note: diceRow will be checked in layoutDiceRow if it exists
+        }
+        resizeCanvas();
+        window.addEventListener('resize', function() {
+            resizeCanvas();
+            // Relayout dice if they exist
+            if (typeof diceRow !== 'undefined' && diceRow && diceRow.length > 0) {
+                layoutDiceRow();
+            }
+        });
+        
+        // Ensure canvas can receive focus for keyboard events
+        canvas.focus();
+        canvas.addEventListener('click', () => canvas.focus());
+        
+        // Draw initial menu
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '60px Arial';
+        ctx.fillText('Loading...', 50, 50);
+        
+        // ==================== GAME STATE ====================
+        let PLAYERS = [];
+        let PLAYER_GOAL = 2000;
+        let MENU_ACTIVE = true;
+        let MENU_INPUT_FIELDS = {
+            player1: "",
+            player2: "",
+            goal_score: "2000"
+        };
+        let MENU_ACTIVE_FIELD = "player1";
+        let MENU_PLAYER2_AI_ENABLED = false;
+        
+        let diceRow = [];
+        let currentPlayerIndex = 0;
+        let playerStats = {};
+        let playerBankedGroups = {};
+        let testInputActive = false;
+        let testInputIndex = 0;
+        let testInputValues = [];
+        let turnOverlayActive = false;
+        let turnOverlayStartTime = 0;
+        let bustOverlayActive = false;
+        let bustOverlayStartTime = 0;
+        let bustPlayer = null;
+        let qKeyHeld = false;
+        let qKeyPressTime = 0;
+        let qKeyActionExecuted = false;
+        let gameWon = false;
+        let winner = null;
+        let rulesOverlayActive = false;
+        let rulesScrollOffset = 0;
+        let flashActive = false;
+        let flashStartTime = 0;
+        const FLASH_DURATION = 1000; // 1 second
+        
+        // AI state
+        let AI_ACTIVE = false;
+        let AI_THINKING = false;
+        let AI_ACTION_QUEUE = [];
+        let AI_ACTION_START_TIME = 0;
+        let AI_MOUSE_POS = null;
+        let AI_TARGET_POS = null;
+        let AI_CLICK_PENDING = false;
+        let AI_LAST_CLICK_TIME = 0;
+        let AI_BANK_AND_PASS_PENDING = false;
+        let AI_BANK_AND_PASS_TIME = 0;
+        
+        // Fake cursor for AI
+        let realMousePos = [0, 0];
+        let fakeCursorPos = [0, 0];
+        let fakeCursorReturning = false;
+        let fakeCursorReturnTarget = [0, 0];
+        let fakeCursorReturnSpeed = 10;
+        let cursorImage = null;
+        
+        // Create cursor image from SVG
+        function createCursorImage() {
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" aria-hidden="true">
+  <path d="M40 20 L40 220 L100 160 L160 240 L200 220 L140 140 L220 140 Z"
+        fill="#ffffff"
+        stroke="#000000"
+        stroke-width="16"
+        stroke-linejoin="round"
+        stroke-linecap="round"/>
+</svg>`;
+            const img = new Image();
+            const svgBlob = new Blob([svg], {type: 'image/svg+xml;charset=utf-8'});
+            const url = URL.createObjectURL(svgBlob);
+            img.onload = () => {
+                cursorImage = img;
+                URL.revokeObjectURL(url);
+            };
+            img.src = url;
+        }
+        createCursorImage();
+        
+        // Celebration particles
+        let fireworks = [];
+        let confetti = [];
+        let sparkles = [];
+        let celebrationStartTime = 0;
+        let lastFireworkTime = 0;
+        let lastConfettiBurst = 0;
+        let lastSparkleBurst = 0;
+        const CELEBRATION_FADE_START = 10000; // 10 seconds - when effects start to fade
+        const CELEBRATION_FADE_END = 15000;   // 15 seconds - when effects are completely faded
+        
+        // ==================== DICE CLASS ====================
+        class Dice {
+            constructor(x, y, value = null, size = null) {
+                this.x = x;
+                this.y = y;
+                this.size = size !== null ? size : DICE_SIZE;
+                this.value = (value >= 1 && value <= 6) ? value : Math.floor(Math.random() * 6) + 1;
+                this.selected = false;
+                this.isHovered = false;
+            }
+            
+            roll() {
+                this.value = Math.floor(Math.random() * 6) + 1;
+                this.selected = false;
+            }
+            
+            draw(ctx) {
+                const color = this.selected ? DICE_SELECTED_COLOR : DICE_COLOR;
+                const outlineColor = this.isHovered ? DICE_HOVER_OUTLINE_COLOR : DICE_OUTLINE_COLOR;
+                Dice.drawFace(ctx, this.x, this.y, this.size, this.value, color, outlineColor);
+            }
+            
+            containsPoint(pos) {
+                const [px, py] = pos;
+                return this.x <= px && px <= this.x + this.size && this.y <= py && py <= this.y + this.size;
+            }
+            
+            static drawFace(ctx, x, y, size, value, fillColor, outlineColor) {
+                // Draw filled rectangle
+                ctx.fillStyle = `rgb(${fillColor[0]}, ${fillColor[1]}, ${fillColor[2]})`;
+                ctx.fillRect(x, y, size, size);
+                
+                // Draw outline
+                const outlineWidth = Math.max(1, Math.floor(size * DICE_OUTLINE_WIDTH / DICE_SIZE));
+                ctx.strokeStyle = `rgb(${outlineColor[0]}, ${outlineColor[1]}, ${outlineColor[2]})`;
+                ctx.lineWidth = outlineWidth;
+                ctx.strokeRect(x, y, size, size);
+                
+                // Draw pips
+                const pipRadius = Math.max(2, Math.floor(size * DICE_PIP_RADIUS / DICE_SIZE));
+                const pipPositions = PIP_MAP[value] || [];
+                ctx.fillStyle = `rgb(${DICE_PIP_COLOR[0]}, ${DICE_PIP_COLOR[1]}, ${DICE_PIP_COLOR[2]})`;
+                
+                for (const [px, py] of pipPositions) {
+                    const cx = x + Math.floor(px * size);
+                    const cy = y + Math.floor(py * size);
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, pipRadius, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+        }
+        
+        // ==================== PARTICLE CLASSES ====================
+        class FireworkParticle {
+            constructor(x, y, vx, vy, color, lifetime) {
+                this.x = x;
+                this.y = y;
+                this.vx = vx;
+                this.vy = vy;
+                this.color = color;
+                this.lifetime = lifetime;
+                this.age = 0;
+                this.size = Math.floor(Math.random() * 3) + 2;
+            }
+            
+            update(dt) {
+                this.x += this.vx * dt;
+                this.y += this.vy * dt;
+                this.vy += 50 * dt; // gravity
+                this.age += dt;
+                return this.age < this.lifetime;
+            }
+            
+            draw(ctx) {
+                const alpha = Math.max(0, 1 - this.age / this.lifetime);
+                const size = Math.max(1, Math.floor(this.size * (1 - this.age / this.lifetime)));
+                ctx.fillStyle = `rgba(${this.color[0]}, ${this.color[1]}, ${this.color[2]}, ${alpha})`;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+        
+        class Firework {
+            constructor(startX, startY, targetY) {
+                this.x = startX;
+                this.y = startY;
+                this.startY = startY;
+                this.targetY = targetY;
+                this.vy = -300 - Math.random() * 200; // Launch speed
+                this.exploded = false;
+                this.particles = [];
+                this.trail = [];
+                this.color = [
+                    [255, 0, 0], [0, 255, 0], [0, 0, 255],
+                    [255, 255, 0], [255, 0, 255], [0, 255, 255],
+                    [255, 165, 0], [255, 20, 147], [50, 205, 50]
+                ][Math.floor(Math.random() * 9)];
+            }
+            
+            explode() {
+                if (this.exploded) return;
+                this.exploded = true;
+                const particleCount = 50 + Math.floor(Math.random() * 30);
+                const colors = [this.color];
+                // Add secondary color for multi-color bursts
+                if (Math.random() > 0.5) {
+                    colors.push([
+                        [255, 0, 0], [0, 255, 0], [0, 0, 255],
+                        [255, 255, 0], [255, 0, 255], [0, 255, 255]
+                    ][Math.floor(Math.random() * 6)]);
+                }
+                
+                for (let i = 0; i < particleCount; i++) {
+                    const angle = (Math.PI * 2 * i) / particleCount + (Math.random() - 0.5) * 0.5;
+                    const speed = 150 + Math.random() * 250;
+                    const vx = Math.cos(angle) * speed;
+                    const vy = Math.sin(angle) * speed;
+                    const lifetime = 1.5 + Math.random() * 1.5;
+                    const color = colors[Math.floor(Math.random() * colors.length)];
+                    this.particles.push(new FireworkParticle(this.x, this.y, vx, vy, color, lifetime));
+                }
+            }
+            
+            update(dt) {
+                if (!this.exploded) {
+                    // Add trail
+                    this.trail.push({x: this.x, y: this.y, age: 0});
+                    this.trail = this.trail.filter(t => {
+                        t.age += dt;
+                        return t.age < 0.2;
+                    });
+                    
+                    // Move upward
+                    this.y += this.vy * dt;
+                    this.vy += 100 * dt; // Gravity slowing it down
+                    
+                    // Explode when reaching target or slowing down too much
+                    if (this.y <= this.targetY || this.vy > -50) {
+                        this.explode();
+                    }
+                } else {
+                    this.particles = this.particles.filter(p => p.update(dt));
+                }
+                return !this.exploded || this.particles.length > 0;
+            }
+            
+            draw(ctx) {
+                if (!this.exploded) {
+                    // Draw trail
+                    for (const point of this.trail) {
+                        const alpha = 1 - (point.age / 0.2);
+                        ctx.fillStyle = `rgba(${this.color[0]}, ${this.color[1]}, ${this.color[2]}, ${alpha * 0.8})`;
+                        ctx.beginPath();
+                        ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                    // Draw firework shell
+                    ctx.fillStyle = `rgb(${this.color[0]}, ${this.color[1]}, ${this.color[2]})`;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    for (const particle of this.particles) {
+                        particle.draw(ctx);
+                    }
+                }
+            }
+        }
+        
+        class ConfettiParticle {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.vx = (Math.random() - 0.5) * 200;
+                this.vy = -100 - Math.random() * 100;
+                this.color = [
+                    [255, 0, 0], [0, 255, 0], [0, 0, 255],
+                    [255, 255, 0], [255, 0, 255], [0, 255, 255],
+                    [255, 165, 0], [255, 192, 203]
+                ][Math.floor(Math.random() * 8)];
+                this.size = 8 + Math.random() * 8;
+                this.rotation = Math.random() * Math.PI * 2;
+                this.rotationSpeed = (Math.random() - 0.5) * 5;
+                this.lifetime = 3 + Math.random() * 2;
+                this.age = 0;
+            }
+            
+            update(dt) {
+                this.x += this.vx * dt;
+                this.y += this.vy * dt;
+                this.vy += 50 * dt;
+                this.rotation += this.rotationSpeed * dt;
+                this.age += dt;
+                return this.age < this.lifetime;
+            }
+            
+            draw(ctx) {
+                const alpha = Math.max(0, 1 - this.age / this.lifetime);
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.rotation);
+                ctx.fillStyle = `rgba(${this.color[0]}, ${this.color[1]}, ${this.color[2]}, ${alpha})`;
+                ctx.fillRect(-this.size / 2, -this.size / 2, this.size, this.size);
+                ctx.restore();
+            }
+        }
+        
+        class Sparkle {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.size = 4 + Math.random() * 8;
+                this.lifetime = 0.8 + Math.random() * 0.7;
+                this.age = 0;
+                this.rotation = Math.random() * Math.PI * 2;
+                this.rotationSpeed = (Math.random() - 0.5) * 8;
+                this.color = [
+                    [255, 255, 255], [255, 215, 0], [255, 20, 147],
+                    [0, 255, 255], [255, 165, 0], [255, 255, 0]
+                ][Math.floor(Math.random() * 6)];
+                this.points = 4 + Math.floor(Math.random() * 4); // 4-7 point star
+            }
+            
+            update(dt) {
+                this.age += dt;
+                this.rotation += this.rotationSpeed * dt;
+                return this.age < this.lifetime;
+            }
+            
+            draw(ctx) {
+                const alpha = Math.max(0, 1 - this.age / this.lifetime);
+                const pulse = Math.sin((this.age / this.lifetime) * Math.PI);
+                const currentSize = this.size * pulse;
+                
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.rotation);
+                ctx.fillStyle = `rgba(${this.color[0]}, ${this.color[1]}, ${this.color[2]}, ${alpha})`;
+                ctx.strokeStyle = `rgba(${this.color[0]}, ${this.color[1]}, ${this.color[2]}, ${alpha * 0.5})`;
+                ctx.lineWidth = 2;
+                
+                // Draw star shape
+                ctx.beginPath();
+                for (let i = 0; i < this.points * 2; i++) {
+                    const angle = (Math.PI * i) / this.points;
+                    const radius = i % 2 === 0 ? currentSize : currentSize * 0.5;
+                    const x = Math.cos(angle) * radius;
+                    const y = Math.sin(angle) * radius;
+                    if (i === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                }
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+        
+        // ==================== CELEBRATION FUNCTIONS ====================
+        function startCelebration() {
+            fireworks = [];
+            confetti = [];
+            sparkles = [];
+            celebrationStartTime = Date.now();
+            lastFireworkTime = 0;
+            lastConfettiBurst = 0;
+            lastSparkleBurst = 0;
+            
+            // Initial burst of effects
+            // Fireworks - launch from bottom
+            for (let i = 0; i < 8; i++) {
+                setTimeout(() => {
+                    const x = width * 0.2 + Math.random() * width * 0.6;
+                    const startY = height - 20;
+                    const targetY = height * 0.2 + Math.random() * height * 0.3;
+                    fireworks.push(new Firework(x, startY, targetY));
+                }, i * 150);
+            }
+            
+            // Initial confetti burst
+            for (let i = 0; i < 150; i++) {
+                setTimeout(() => {
+                    const x = Math.random() * width;
+                    const y = -20 - Math.random() * 50;
+                    confetti.push(new ConfettiParticle(x, y));
+                }, i * 30);
+            }
+            
+            // Initial sparkles around winner text area
+            for (let i = 0; i < 80; i++) {
+                setTimeout(() => {
+                    const centerX = width / 2;
+                    const centerY = height / 2 - 100;
+                    const angle = Math.random() * Math.PI * 2;
+                    const distance = 100 + Math.random() * 300;
+                    const x = centerX + Math.cos(angle) * distance;
+                    const y = centerY + Math.sin(angle) * distance;
+                    sparkles.push(new Sparkle(x, y));
+                }, i * 50);
+            }
+        }
+        
+        function updateCelebration(dt) {
+            if (celebrationStartTime === 0) return; // Celebration not started yet
+            
+            const currentTime = Date.now();
+            const elapsed = currentTime - celebrationStartTime;
+            
+            // Continuous fireworks - spawn every 300-600ms
+            if (elapsed - lastFireworkTime > 300 + Math.random() * 300) {
+                const x = width * 0.15 + Math.random() * width * 0.7;
+                const startY = height - 20;
+                const targetY = height * 0.15 + Math.random() * height * 0.35;
+                fireworks.push(new Firework(x, startY, targetY));
+                lastFireworkTime = elapsed;
+            }
+            
+            // Continuous confetti - spawn bursts every 200-400ms
+            if (elapsed - lastConfettiBurst > 200 + Math.random() * 200) {
+                const burstCount = 5 + Math.floor(Math.random() * 10);
+                for (let i = 0; i < burstCount; i++) {
+                    const x = Math.random() * width;
+                    const y = -20 - Math.random() * 30;
+                    confetti.push(new ConfettiParticle(x, y));
+                }
+                lastConfettiBurst = elapsed;
+            }
+            
+            // Continuous sparkles - spawn around winner text every 100-250ms
+            if (elapsed - lastSparkleBurst > 100 + Math.random() * 150) {
+                const sparkleCount = 2 + Math.floor(Math.random() * 4);
+                for (let i = 0; i < sparkleCount; i++) {
+                    const centerX = width / 2;
+                    const centerY = height / 2 - 100;
+                    const angle = Math.random() * Math.PI * 2;
+                    const distance = 50 + Math.random() * 400;
+                    const x = centerX + Math.cos(angle) * distance;
+                    const y = centerY + Math.sin(angle) * distance;
+                    sparkles.push(new Sparkle(x, y));
+                }
+                lastSparkleBurst = elapsed;
+            }
+            
+            // Update all particles
+            fireworks = fireworks.filter(f => f.update(dt));
+            confetti = confetti.filter(c => c.update(dt));
+            sparkles = sparkles.filter(s => s.update(dt));
+        }
+        
+        function drawCelebration(ctx) {
+            for (const firework of fireworks) {
+                firework.draw(ctx);
+            }
+            for (const confettiParticle of confetti) {
+                confettiParticle.draw(ctx);
+            }
+            for (const sparkle of sparkles) {
+                sparkle.draw(ctx);
+            }
+        }
+        
+        // ==================== DICE LAYOUT ====================
+        function computeDicePositions(count, size) {
+            const diceGap = scaleValue(20);
+            const totalWidth = count * size + (count - 1) * diceGap;
+            const startX = (width - totalWidth) / 2;
+            // Position dice above controls (controls are at height - scaleValue(40))
+            const y = height - scaleValue(180);
+            const positions = [];
+            for (let i = 0; i < count; i++) {
+                positions.push([startX + i * (size + diceGap), y - size / 2]);
+            }
+            return positions;
+        }
+        
+        function layoutDiceRow() {
+            const scaledDiceSize = scaleValue(DICE_SIZE);
+            const positions = computeDicePositions(diceRow.length, scaledDiceSize);
+            for (let i = 0; i < diceRow.length; i++) {
+                diceRow[i].x = positions[i][0];
+                diceRow[i].y = positions[i][1];
+                diceRow[i].size = scaledDiceSize;
+            }
+        }
+        
+        function createStartingDice() {
+            diceRow = [];
+            for (let i = 0; i < DICE_COUNT; i++) {
+                diceRow.push(new Dice(0, 0));
+            }
+            layoutDiceRow();
+            return diceRow;
+        }
+        
+        // ==================== SCORING FUNCTIONS ====================
+        function calculateSelectedScore(selectedDice) {
+            const counts = {};
+            for (const dice of selectedDice) {
+                counts[dice.value] = (counts[dice.value] || 0) + 1;
+            }
+            
+            let score = 0;
+            const remaining = {...counts};
+            
+            function consumeSequence(values, points) {
+                while (values.every(v => (remaining[v] || 0) > 0)) {
+                    score += points;
+                    for (const v of values) {
+                        remaining[v]--;
+                    }
+                }
+            }
+            
+            // Straights first
+            consumeSequence([1, 2, 3, 4, 5, 6], 1500);
+            consumeSequence([1, 2, 3, 4, 5], 500);
+            consumeSequence([2, 3, 4, 5, 6], 750);
+            
+            for (let value = 1; value <= 6; value++) {
+                const count = remaining[value] || 0;
+                if (count <= 0) continue;
+                
+                if (value === 1) {
+                    if (count >= 3) {
+                        score += 1000 * Math.pow(2, count - 3);
+                    } else {
+                        score += count * 100;
+                    }
+                    remaining[value] = 0;
+                } else if (value === 5) {
+                    if (count >= 3) {
+                        score += 5 * 100 * Math.pow(2, count - 3);
+                    } else {
+                        score += count * 50;
+                    }
+                    remaining[value] = 0;
+                } else {
+                    if (count >= 3) {
+                        score += value * 100 * Math.pow(2, count - 3);
+                        remaining[value] = 0;
+                    } else {
+                        return 0;
+                    }
+                }
+            }
+            
+            if (Object.values(remaining).some(v => v > 0)) {
+                return 0;
+            }
+            
+            return score;
+        }
+        
+        function updateSelectedScore() {
+            const selectedDice = diceRow.filter(d => d.selected);
+            const score = calculateSelectedScore(selectedDice);
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            playerStats[currentPlayer].selectedScore = score;
+        }
+        
+        function calculateScoreFromValues(values) {
+            const tempDice = values.map(v => ({value: v}));
+            return calculateSelectedScore(tempDice);
+        }
+        
+        function canScoreFromValues(values) {
+            const n = values.length;
+            for (let mask = 1; mask < (1 << n); mask++) {
+                const subset = [];
+                for (let i = 0; i < n; i++) {
+                    if (mask & (1 << i)) {
+                        subset.push(values[i]);
+                    }
+                }
+                if (calculateScoreFromValues(subset) > 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        
+        // ==================== GAME LOGIC ====================
+        function resetDiceRow(count = DICE_COUNT) {
+            diceRow = [];
+            for (let i = 0; i < count; i++) {
+                diceRow.push(new Dice(0, 0));
+            }
+            layoutDiceRow();
+            for (const dice of diceRow) {
+                dice.selected = false;
+                dice.isHovered = false;
+            }
+            testInputValues = diceRow.map(d => d.value);
+            
+            // Broadcast dice roll in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'dice_roll',
+                    diceValues: diceRow.map(d => d.value),
+                    playerIndex: currentPlayerIndex
+                });
+            }
+        }
+        
+        function startNextPlayerTurn() {
+            currentPlayerIndex = (currentPlayerIndex + 1) % PLAYERS.length;
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            playerBankedGroups[currentPlayer] = [];
+            playerStats[currentPlayer].selectedScore = 0;
+            playerStats[currentPlayer].displayedBankedPoints = 0;
+            resetDiceRow(DICE_COUNT);
+            updateSelectedScore();
+            checkForBust();
+            
+            // Broadcast turn change in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'player_turn',
+                    playerIndex: currentPlayerIndex
+                });
+            }
+            
+            AI_THINKING = false;
+            AI_ACTION_QUEUE = [];
+            AI_MOUSE_POS = null;
+            AI_TARGET_POS = null;
+            AI_CLICK_PENDING = false;
+            AI_LAST_CLICK_TIME = 0;
+            AI_BANK_AND_PASS_PENDING = false;
+            AI_BANK_AND_PASS_TIME = 0;
+            
+            turnOverlayActive = true;
+            turnOverlayStartTime = Date.now();
+        }
+        
+        function handleBust() {
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            bustOverlayActive = true;
+            bustOverlayStartTime = Date.now();
+            bustPlayer = currentPlayer;
+            playerStats[currentPlayer].selectedScore = 0;
+            playerStats[currentPlayer].displayedBankedPoints = 0;
+            playerBankedGroups[currentPlayer] = [];
+        }
+        
+        function completeBust() {
+            bustOverlayActive = false;
+            bustPlayer = null;
+            startNextPlayerTurn();
+        }
+        
+        function checkForBust() {
+            const values = diceRow.map(d => d.value);
+            if (!canScoreFromValues(values)) {
+                handleBust();
+            }
+        }
+        
+        function bankSelectedDice() {
+            const selectedDice = diceRow.filter(d => d.selected);
+            if (selectedDice.length === 0) return;
+            
+            const score = calculateSelectedScore(selectedDice);
+            if (score === 0) return;
+            
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            const values = selectedDice.map(d => d.value);
+            playerBankedGroups[currentPlayer].push([...values]);
+            playerStats[currentPlayer].bankedPoints += score;
+            playerStats[currentPlayer].displayedBankedPoints = playerStats[currentPlayer].bankedPoints;
+            
+            const remainingCount = diceRow.length - selectedDice.length;
+            if (remainingCount === 0) {
+                resetDiceRow(DICE_COUNT);
+            } else {
+                resetDiceRow(remainingCount);
+            }
+            
+            updateSelectedScore();
+            checkForBust();
+            
+            // Broadcast bank action in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'bank_dice',
+                    playerIndex: currentPlayerIndex
+                });
+            }
+        }
+        
+        function bankAndPassTurn() {
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            const stats = playerStats[currentPlayer];
+            
+            // Only proceed if there's a selected score
+            if (stats.selectedScore <= 0) {
+                console.log('bankAndPassTurn: No selected score, returning early');
+                return;
+            }
+            
+            const selectedDice = diceRow.filter(d => d.selected);
+            if (selectedDice.length === 0) {
+                console.log('bankAndPassTurn: No selected dice, returning early');
+                return;
+            }
+            
+            console.log('bankAndPassTurn: Executing with score:', stats.selectedScore);
+            
+            // Bank the selected dice
+            const values = selectedDice.map(d => d.value);
+            playerBankedGroups[currentPlayer].push([...values]);
+            stats.bankedPoints += stats.selectedScore;
+            stats.selectedScore = 0;
+            
+            // Add banked points to game points (permanent score)
+            stats.gamePoints += stats.bankedPoints;
+            stats.displayedBankedPoints = stats.bankedPoints;
+            stats.bankedPoints = 0;
+            
+            // Check for win condition
+            if (stats.gamePoints >= PLAYER_GOAL) {
+                gameWon = true;
+                winner = currentPlayer;
+                startCelebration();
+                return;
+            }
+            
+            // Broadcast bank and pass action in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                broadcastAction({
+                    type: 'bank_and_pass',
+                    playerIndex: currentPlayerIndex
+                });
+            }
+            
+            // Pass to next player
+            console.log('bankAndPassTurn: Calling startNextPlayerTurn');
+            startNextPlayerTurn();
+        }
+        
+        // ==================== AI FUNCTIONS ====================
+        function findAllScoringCombinations(diceList) {
+            const combinations = [];
+            const n = diceList.length;
+            const values = diceList.map(d => d.value);
+            
+            for (let mask = 1; mask < (1 << n); mask++) {
+                const subsetIndices = [];
+                for (let i = 0; i < n; i++) {
+                    if (mask & (1 << i)) {
+                        subsetIndices.push(i);
+                    }
+                }
+                const subsetDice = subsetIndices.map(i => diceList[i]);
+                const subsetValues = subsetIndices.map(i => values[i]);
+                
+                const score = calculateSelectedScore(subsetDice);
+                if (score > 0) {
+                    combinations.push({
+                        indices: subsetIndices,
+                        dice: subsetDice,
+                        values: subsetValues,
+                        score: score
+                    });
+                }
+            }
+            
+            combinations.sort((a, b) => b.score - a.score);
+            return combinations;
+        }
+        
+        function aiChooseCombination(combinations) {
+            if (combinations.length === 0) return null;
+            
+            if (Math.random() < 0.3 && combinations.length > 1) {
+                const maxChoices = Math.min(3, combinations.length);
+                const choiceIndex = Math.floor(Math.random() * maxChoices);
+                return combinations[choiceIndex];
+            } else {
+                return combinations[0];
+            }
+        }
+        
+        function aiSimulateMouseMove(currentPos, targetPos, speed) {
+            if (!currentPos) {
+                return targetPos;
+            }
+            
+            const dx = targetPos[0] - currentPos[0];
+            const dy = targetPos[1] - currentPos[1];
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            if (distance <= speed) {
+                return targetPos;
+            }
+            
+            const ratio = speed / distance;
+            const newX = currentPos[0] + dx * ratio;
+            const newY = currentPos[1] + dy * ratio;
+            return [newX, newY];
+        }
+        
+        function aiClickDice(dice) {
+            dice.selected = !dice.selected;
+            updateSelectedScore();
+        }
+        
+        function aiMakeDecision() {
+            if (diceRow.length === 0) return;
+            
+            const currentPlayer = PLAYERS[currentPlayerIndex];
+            const stats = playerStats[currentPlayer];
+            const selectedDice = diceRow.filter(d => d.selected);
+            
+            if (selectedDice.length > 0 && stats.selectedScore > 0) {
+                const bankedPoints = stats.bankedPoints;
+                const selectedScore = stats.selectedScore;
+                const remainingCount = diceRow.length - selectedDice.length;
+                const allDiceSelected = (remainingCount === 0);
+                
+                const takeRisk = Math.random() < 0.15;
+                const forgotFreshDiceRule = Math.random() < 0.25;
+                
+                if (allDiceSelected && !forgotFreshDiceRule) {
+                    if (Math.random() < 0.85) {
+                        AI_ACTION_QUEUE.push(['press_f', null]);
+                    } else {
+                        AI_ACTION_QUEUE.push(['hold_q', null]);
+                    }
+                    return;
+                }
+                
+                if (bankedPoints + selectedScore >= 300 && !takeRisk) {
+                    if (Math.random() < 0.7) {
+                        AI_ACTION_QUEUE.push(['hold_q', null]);
+                        return;
+                    }
+                }
+                
+                if (remainingCount <= 2 && takeRisk) {
+                    AI_ACTION_QUEUE.push(['press_f', null]);
+                    return;
+                }
+                
+                if (remainingCount >= 3) {
+                    if (Math.random() < 0.8) {
+                        AI_ACTION_QUEUE.push(['press_f', null]);
+                    } else {
+                        AI_ACTION_QUEUE.push(['hold_q', null]);
+                    }
+                } else {
+                    if (Math.random() < 0.7 || takeRisk) {
+                        AI_ACTION_QUEUE.push(['hold_q', null]);
+                    } else {
+                        AI_ACTION_QUEUE.push(['press_f', null]);
+                    }
+                }
+                return;
+            }
+            
+            const combinations = findAllScoringCombinations(diceRow);
+            if (combinations.length === 0) return;
+            
+            const chosen = aiChooseCombination(combinations);
+            if (!chosen) return;
+            
+            for (const dice of diceRow) {
+                if (dice.selected) {
+                    AI_ACTION_QUEUE.push(['click', dice]);
+                }
+            }
+            
+            for (const idx of chosen.indices) {
+                const dice = diceRow[idx];
+                if (!dice.selected) {
+                    AI_ACTION_QUEUE.push(['click', dice]);
+                }
+            }
+        }
+        
+        function aiUpdate() {
+            const aiShouldControl = (currentPlayerIndex === 1 && MENU_PLAYER2_AI_ENABLED &&
+                !turnOverlayActive && !bustOverlayActive && !gameWon && !testInputActive);
+            
+            const wasActive = AI_ACTIVE;
+            
+            if (!aiShouldControl) {
+                if (wasActive) {
+                    // AI just became inactive - start returning fake cursor
+                    fakeCursorReturning = true;
+                    fakeCursorReturnTarget = [...realMousePos];
+                }
+                AI_ACTIVE = false;
+                if (!fakeCursorReturning) {
+                    canvas.classList.remove('ai-active');
+                }
+                return;
+            }
+            
+            // AI just became active - initialize fake cursor
+            if (!wasActive) {
+                fakeCursorPos = [...realMousePos];
+                fakeCursorReturning = false;
+            }
+            
+            AI_ACTIVE = true;
+            canvas.classList.add('ai-active');
+            const currentTime = Date.now();
+            
+            if (AI_THINKING) {
+                if (currentTime - AI_ACTION_START_TIME >= AI_DECISION_DELAY) {
+                    AI_THINKING = false;
+                    aiMakeDecision();
+                }
+                return;
+            }
+            
+            if (AI_ACTION_QUEUE.length === 0) {
+                AI_THINKING = true;
+                AI_ACTION_START_TIME = currentTime;
+                return;
+            }
+            
+            const [action, dice] = AI_ACTION_QUEUE[0];
+            
+            if (action === 'click') {
+                // Initialize mouse position if needed
+                if (AI_MOUSE_POS === null) {
+                    // Start from current fake cursor position or real mouse position
+                    AI_MOUSE_POS = (fakeCursorPos[0] > 0 || fakeCursorPos[1] > 0) ? [...fakeCursorPos] : [...realMousePos];
+                    fakeCursorPos = [...AI_MOUSE_POS];
+                }
+                
+                // Set target to dice center
+                const targetX = dice.x + dice.size / 2;
+                const targetY = dice.y + dice.size / 2;
+                AI_TARGET_POS = [targetX, targetY];
+                
+                // Simulate mouse movement towards dice
+                AI_MOUSE_POS = aiSimulateMouseMove(AI_MOUSE_POS, AI_TARGET_POS, AI_MOUSE_MOVE_SPEED);
+                // Update fake cursor position to match AI mouse
+                fakeCursorPos = [...AI_MOUSE_POS];
+                
+                // Check if we've reached the target
+                const dx = AI_TARGET_POS[0] - AI_MOUSE_POS[0];
+                const dy = AI_TARGET_POS[1] - AI_MOUSE_POS[1];
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                
+                if (distance <= AI_MOUSE_MOVE_SPEED) {
+                    // Reached target, now click
+                    if (currentTime - AI_LAST_CLICK_TIME >= AI_CLICK_DELAY) {
+                        aiClickDice(dice);
+                        AI_ACTION_QUEUE.shift();
+                        AI_LAST_CLICK_TIME = currentTime;
+                        AI_MOUSE_POS = null;
+                        AI_TARGET_POS = null;
+                    }
+                }
+                // Otherwise, continue moving next frame
+            } else if (action === 'press_f') {
+                bankSelectedDice();
+                AI_ACTION_QUEUE.shift();
+            } else if (action === 'hold_q') {
+                if (!AI_BANK_AND_PASS_PENDING) {
+                    AI_BANK_AND_PASS_PENDING = true;
+                    AI_BANK_AND_PASS_TIME = currentTime;
+                }
+                if (currentTime - AI_BANK_AND_PASS_TIME >= HOLD_DURATION) {
+                    bankAndPassTurn();
+                    AI_BANK_AND_PASS_PENDING = false;
+                    AI_ACTION_QUEUE.shift();
+                }
+            }
+        }
+        
+        // ==================== DRAWING FUNCTIONS ====================
+        function drawScoreboard(ctx) {
+            const scale = getScale();
+            const scaledColumnWidth = scaleValue(SCOREBOARD_COLUMN_WIDTH);
+            const scaledColumnGap = scaleValue(SCOREBOARD_COLUMN_GAP);
+            const scaledMarginX = scaleValue(SCOREBOARD_MARGIN_X);
+            const scaledRowGap = scaleValue(SCOREBOARD_ROW_GAP);
+            
+            const totalWidth = scaledColumnWidth * 2 + scaledColumnGap;
+            const leftBaseX = scaledMarginX;
+            const rightBaseX = width - scaledMarginX - totalWidth;
+            
+            const dividerColor = '#646464';
+            const baseHeight = scaledRowGap * 4; // 3 rows + header
+            const dividerHeight = baseHeight;
+            
+            // Draw dividers
+            for (const baseX of [leftBaseX, rightBaseX]) {
+                ctx.strokeStyle = dividerColor;
+                ctx.lineWidth = Math.max(1, Math.floor(4 * scale));
+                ctx.beginPath();
+                ctx.moveTo(baseX + scaledColumnWidth, SCOREBOARD_TOP);
+                ctx.lineTo(baseX + scaledColumnWidth, SCOREBOARD_TOP + dividerHeight);
+                ctx.stroke();
+            }
+            
+            const column2XOffset = scaledColumnWidth + scaledColumnGap;
+            
+            for (let playerIdx = 0; playerIdx < PLAYERS.length; playerIdx++) {
+                const player = PLAYERS[playerIdx];
+                const baseX = playerIdx === 0 ? leftBaseX : rightBaseX;
+                const stats = playerStats[player];
+                const isActivePlayer = (playerIdx === currentPlayerIndex);
+                
+                // Show displayed_banked_points for non-active players, actual banked_points for active player
+                const bankedDisplay = isActivePlayer ? stats.bankedPoints : stats.displayedBankedPoints;
+                
+                const column1CenterX = baseX + scaledColumnWidth / 2;
+                const column2CenterX = baseX + scaledColumnWidth + scaledColumnGap + scaledColumnWidth / 2;
+                
+                // Header row
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#C8C8C8';
+                ctx.font = `${scaleFont(40)}px Arial`;
+                ctx.fillText('Goal', column2CenterX, SCOREBOARD_TOP);
+                
+                ctx.fillStyle = isActivePlayer ? '#FFD700' : '#FFFFFF';
+                ctx.fillText(player, column1CenterX, SCOREBOARD_TOP);
+                
+                // Data rows
+                const column1Values = [
+                    stats.gamePoints || 0, // game_points (permanent total score)
+                    bankedDisplay,
+                    stats.selectedScore
+                ];
+                const column2Rows = [
+                    `${PLAYER_GOAL}`,
+                    'Banked',
+                    'Selected'
+                ];
+                
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = `${scaleFont(32)}px Arial`;
+                
+                for (let rowIdx = 0; rowIdx < column1Values.length; rowIdx++) {
+                    const y = SCOREBOARD_TOP + (rowIdx + 1) * scaledRowGap;
+                    
+                    // Column 1: values
+                    ctx.fillText(String(column1Values[rowIdx]), column1CenterX, y);
+                    
+                    // Column 2: labels
+                    ctx.fillStyle = '#C8C8C8';
+                    ctx.fillText(column2Rows[rowIdx], column2CenterX, y);
+                    ctx.fillStyle = '#FFFFFF';
+                }
+                
+                ctx.textAlign = 'left';
+                
+                // Banked dice
+                drawBankedDiceForPlayer(ctx, baseX, totalWidth, playerBankedGroups[player]);
+            }
+        }
+        
+        function drawBankedDiceForPlayer(ctx, baseX, totalWidth, groups) {
+            if (!groups || groups.length === 0) return;
+            
+            const scale = getScale();
+            const size = Math.floor(scaleValue(DICE_SIZE) * BANKED_DICE_SCALE);
+            const bankTop = SCOREBOARD_TOP + scaleValue(SCOREBOARD_ROW_GAP) * 4 + scaleValue(BANKED_DICE_MARGIN_TOP);
+            
+            for (let rowIndex = 0; rowIndex < groups.length; rowIndex++) {
+                const rowValues = [...groups[rowIndex]].sort((a, b) => a - b);
+                if (rowValues.length === 0) continue;
+                
+                const scaledDiceGap = scaleValue(BANKED_DICE_GAP);
+                const rowWidth = rowValues.length * size + Math.max(0, rowValues.length - 1) * scaledDiceGap;
+                const startX = baseX + (totalWidth - rowWidth) / 2;
+                const y = bankTop + rowIndex * (size + scaledDiceGap);
+                
+                for (let col = 0; col < rowValues.length; col++) {
+                    const x = startX + col * (size + scaledDiceGap);
+                    Dice.drawFace(ctx, x, y, size, rowValues[col], DICE_COLOR, DICE_OUTLINE_COLOR);
+                }
+            }
+        }
+        
+        function drawGameControls(ctx) {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${scaleFont(24)}px Arial`;
+            ctx.textAlign = 'center';
+            const controls = [
+                "Click dice to select | F: Bank & Reroll | Hold Q: Bank & Pass | R: Rules | ESC: Quit"
+            ];
+            const y = height - scaleValue(40);
+            ctx.fillText(controls[0], width / 2, y);
+            ctx.textAlign = 'left';
+        }
+        
+        function drawTurnOverlay(ctx) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+            ctx.fillRect(0, 0, width, height);
+            
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${scaleFont(120)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText(`${PLAYERS[currentPlayerIndex]}'s Turn`, width / 2, height / 2);
+            ctx.textAlign = 'left';
+        }
+        
+        function drawBustMessage(ctx) {
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.8)';
+            ctx.font = `bold ${scaleFont(80)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText(`${bustPlayer} BUSTED!`, width / 2, height / 2);
+            ctx.textAlign = 'left';
+        }
+        
+        function drawWinOverlay(ctx) {
+            const currentTime = Date.now();
+            // Use celebrationStartTime if set, otherwise use current time
+            const startTime = celebrationStartTime || currentTime;
+            const elapsed = (currentTime - startTime) / 1000;
+            
+            // Animated background with pulsing opacity
+            const bgPulse = 0.7 + Math.sin(elapsed * 2) * 0.1;
+            ctx.fillStyle = `rgba(0, 0, 0, ${bgPulse})`;
+            ctx.fillRect(0, 0, width, height);
+            
+            // Draw winner text with glow and pulse effect
+            const textPulse = 1 + Math.sin(elapsed * 3) * 0.15;
+            const glowIntensity = 0.5 + Math.sin(elapsed * 4) * 0.3;
+            const textY = height / 2 - scaleValue(100);
+            const baseFontSize = scaleFont(120);
+            
+            // Draw glow effect (multiple layers)
+            ctx.shadowBlur = scaleValue(30) + Math.sin(elapsed * 2) * scaleValue(10);
+            ctx.shadowColor = `rgba(255, 215, 0, ${glowIntensity})`;
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `bold ${baseFontSize * textPulse}px Arial`;
+            ctx.textAlign = 'center';
+            
+            // Draw text multiple times for stronger glow
+            for (let i = 0; i < 3; i++) {
+                ctx.fillText(`${winner} WINS!`, width / 2, textY);
+            }
+            
+            // Reset shadow
+            ctx.shadowBlur = 0;
+            ctx.shadowColor = 'transparent';
+            
+            // Draw text again without glow for crispness
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `bold ${baseFontSize * textPulse}px Arial`;
+            ctx.fillText(`${winner} WINS!`, width / 2, textY);
+            
+            // Show each player's score with fade-in animation
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${scaleFont(40)}px Arial`;
+            let scoreY = height / 2 + scaleValue(20);
+            const scoreSpacing = scaleValue(50);
+            const fadeInTime = Math.min(elapsed * 0.5, 1);
+            
+            for (let idx = 0; idx < PLAYERS.length; idx++) {
+                const player = PLAYERS[idx];
+                const playerScore = playerStats[player].gamePoints || 0;
+                const isWinner = player === winner;
+                const alpha = fadeInTime;
+                
+                if (isWinner) {
+                    // Highlight winner's score with gold
+                    ctx.fillStyle = `rgba(255, 215, 0, ${alpha})`;
+                    ctx.font = `bold ${scaleFont(45)}px Arial`;
+                } else {
+                    ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+                    ctx.font = `${scaleFont(40)}px Arial`;
+                }
+                ctx.fillText(`${player}: ${playerScore}`, width / 2, scoreY + idx * scoreSpacing);
+            }
+            
+            // Instructions with subtle pulse
+            const instructionPulse = 0.7 + Math.sin(elapsed * 1.5) * 0.3;
+            ctx.fillStyle = `rgba(200, 200, 200, ${instructionPulse})`;
+            ctx.font = `${scaleFont(32)}px Arial`;
+            ctx.fillText(`Press SPACE to return to menu`, width / 2, height / 2 + scaleValue(140));
+            ctx.textAlign = 'left';
+        }
+        
+        function drawFakeCursor(ctx) {
+            // Handle fake cursor returning to real mouse
+            if (fakeCursorReturning) {
+                fakeCursorPos = aiSimulateMouseMove(fakeCursorPos, fakeCursorReturnTarget, fakeCursorReturnSpeed);
+                const dx = fakeCursorReturnTarget[0] - fakeCursorPos[0];
+                const dy = fakeCursorReturnTarget[1] - fakeCursorPos[1];
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                if (distance <= fakeCursorReturnSpeed) {
+                    fakeCursorReturning = false;
+                    canvas.classList.remove('ai-active');
+                }
+            }
+            
+            // Draw fake cursor if AI is active or returning
+            if (AI_ACTIVE || fakeCursorReturning) {
+                const [x, y] = fakeCursorPos;
+                
+                // Draw SVG cursor image
+                if (cursorImage && cursorImage.complete) {
+                    const cursorSize = 24; // Size of cursor on screen
+                    // Offset to align tip (40, 20 in 256x256 viewBox) with mouse position
+                    const tipOffsetX = (40 / 256) * cursorSize;
+                    const tipOffsetY = (20 / 256) * cursorSize;
+                    ctx.drawImage(cursorImage, x - tipOffsetX, y - tipOffsetY, cursorSize, cursorSize);
+                } else {
+                    // Fallback: draw simple cursor if image not loaded yet
+                    ctx.save();
+                    ctx.translate(x, y);
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.strokeStyle = '#000000';
+                    ctx.lineWidth = 2;
+                    ctx.lineJoin = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(0, 0);
+                    ctx.lineTo(8, 8);
+                    ctx.lineTo(2, 8);
+                    ctx.lineTo(2, 16);
+                    ctx.lineTo(-2, 16);
+                    ctx.lineTo(-2, 8);
+                    ctx.lineTo(-8, 8);
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+        }
+        
+        function drawPassProgressDoughnut(ctx) {
+            if (!qKeyHeld && !AI_BANK_AND_PASS_PENDING) return;
+            
+            const currentTime = Date.now();
+            const startTime = qKeyHeld ? qKeyPressTime : AI_BANK_AND_PASS_TIME;
+            const elapsed = currentTime - startTime;
+            const progress = Math.min(elapsed / HOLD_DURATION, 1);
+            
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const radius = scaleValue(35);
+            const lineWidth = Math.max(1, Math.floor(6 * getScale()));
+            
+            // Background circle
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.lineWidth = lineWidth;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+            ctx.stroke();
+            
+            // Progress arc
+            ctx.strokeStyle = '#FFD700';
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+            ctx.stroke();
+        }
+        
+        function drawRulesOverlay(ctx) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.94)';
+            ctx.fillRect(0, 0, width, height);
+            
+            const scale = getScale();
+            
+            // Calculate available space and adjust sizes accordingly
+            const titleHeight = scaleValue(100);
+            const footerHeight = scaleValue(40);
+            const contentTop = titleHeight + scaleValue(60);
+            const contentBottom = height - footerHeight - scaleValue(20);
+            const availableHeight = contentBottom - contentTop;
+            
+            // Calculate compact spacing based on available height
+            // We need: 3 section titles + 10 rule rows + 2 section spacings = ~15 rows
+            const maxRowSpacing = Math.max(scaleValue(40), availableHeight / 16);
+            const rowSpacing = Math.min(scaleValue(60), maxRowSpacing);
+            const sectionSpacing = Math.max(scaleValue(10), rowSpacing * 0.3);
+            
+            // Adjust font sizes to fit
+            const titleFontSize = Math.min(scaleFont(100), scaleFont(80));
+            const sectionFontSize = Math.min(scaleFont(40), scaleFont(35));
+            const ruleFontSize = Math.min(scaleFont(32), scaleFont(28));
+            const explanationFontSize = Math.min(scaleFont(26), scaleFont(22));
+            
+            // Adjust dice size to fit
+            const diceSize = Math.min(scaleValue(50), scaleValue(45));
+            const diceGap = scaleValue(6);
+            
+            // Draw title
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `bold ${titleFontSize}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText('Scoring Rules', width / 2, titleHeight);
+            
+            // Draw footer
+            ctx.fillStyle = '#C8C8C8';
+            ctx.font = `${scaleFont(24)}px Arial`;
+            ctx.fillText('Press R to close', width / 2, height - footerHeight);
+            
+            let y = contentTop;
+            const diceStartX = width / 2 - scaleValue(120);
+            const scoreTextX = width / 2 + scaleValue(200);
+            const labelX = Math.max(scaleValue(20), diceStartX - scaleValue(300));
+            const diceCenterYOffset = diceSize / 2;
+            
+            // Ensure scoreTextX doesn't go off the right edge
+            const maxScoreTextX = width - scaleValue(20);
+            const actualScoreTextX = Math.min(scoreTextX, maxScoreTextX);
+            
+            ctx.textAlign = 'left';
+            
+            // Helper function to draw a row of dice
+            function drawDiceRow(values, startX, yPos, size, gap) {
+                let x = startX;
+                for (const value of values) {
+                    Dice.drawFace(ctx, x, yPos - diceCenterYOffset, size, value, DICE_COLOR, DICE_OUTLINE_COLOR);
+                    x += size + gap;
+                }
+            }
+            
+            // Rule 1: Straights
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `${sectionFontSize}px Arial`;
+            ctx.fillText('Straights:', labelX, y);
+            y += rowSpacing;
+            
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${ruleFontSize}px Arial`;
+            
+            // Straight 1-6
+            ctx.fillText('Straight 1-6:', labelX, y);
+            drawDiceRow([1, 2, 3, 4, 5, 6], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 1500', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Straight 1-5
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Straight 1-5:', labelX, y);
+            drawDiceRow([1, 2, 3, 4, 5], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 500', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Straight 2-6
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Straight 2-6:', labelX, y);
+            drawDiceRow([2, 3, 4, 5, 6], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 750', actualScoreTextX, y);
+            y += rowSpacing + sectionSpacing;
+            
+            // Rule 2: Three or More of a Kind
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `${sectionFontSize}px Arial`;
+            ctx.fillText('Three or More:', labelX, y);
+            y += rowSpacing;
+            
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${ruleFontSize}px Arial`;
+            
+            // Three 1s
+            ctx.fillText('Three 1s:', labelX, y);
+            drawDiceRow([1, 1, 1], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 1000', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Four 1s
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Four 1s:', labelX, y);
+            drawDiceRow([1, 1, 1, 1], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 2000 (2×)', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Three 5s
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Three 5s:', labelX, y);
+            drawDiceRow([5, 5, 5], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 500', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Three 2s, 3s, 4s, or 6s
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Three 2s/3s/4s/6s:', labelX, y);
+            drawDiceRow([2, 2, 2], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 200', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Explanation note
+            ctx.fillStyle = '#B4B4B4';
+            ctx.font = `${explanationFontSize}px Arial`;
+            ctx.fillText('Extra dice double: 4=2×, 5=4×, 6=8×', labelX, y);
+            y += rowSpacing + sectionSpacing;
+            
+            // Rule 3: Single Dice
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `${sectionFontSize}px Arial`;
+            ctx.fillText('Single Dice:', labelX, y);
+            y += rowSpacing;
+            
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${ruleFontSize}px Arial`;
+            
+            // Single 1
+            ctx.fillText('Single 1:', labelX, y);
+            drawDiceRow([1], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 100', actualScoreTextX, y);
+            y += rowSpacing;
+            
+            // Single 5
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Single 5:', labelX, y);
+            drawDiceRow([5], diceStartX, y, diceSize, diceGap);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('= 50', actualScoreTextX, y);
+            
+            ctx.textAlign = 'left';
+        }
+        
+        function drawMenu(ctx) {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, width, height);
+            
+            const scale = getScale();
+            
+            // Title
+            ctx.fillStyle = '#FFD700';
+            ctx.font = `bold ${scaleFont(120)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText('KCD Dice Game', width / 2, height * 0.15);
+            
+            // Menu content - centered
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `${scaleFont(60)}px Arial`;
+            
+            const menuCenterX = width / 2;
+            const menuStartY = height * 0.3;
+            const fieldSpacing = scaleValue(100);
+            const fieldWidth = Math.min(scaleValue(400), width * 0.3);
+            const labelWidth = scaleValue(250);
+            const labelGap = scaleValue(200); // Gap between label and field
+            
+            // Calculate positions: labels on left, fields on right, all centered as a group
+            const totalWidth = labelWidth + labelGap + fieldWidth;
+            const groupLeft = menuCenterX - totalWidth / 2;
+            const labelX = groupLeft;
+            const fieldX = groupLeft + labelWidth + labelGap;
+            
+            let currentY = menuStartY;
+            const boxHeight = scaleValue(60);
+            const boxOffset = scaleValue(40);
+            const textPadding = scaleValue(10);
+            
+            // Player 1
+            ctx.fillText('Player 1 Name:', labelX, currentY);
+            ctx.fillStyle = MENU_ACTIVE_FIELD === 'player1' ? '#FFD700' : '#FFFFFF';
+            const boxY1 = currentY - boxOffset;
+            ctx.fillRect(fieldX, boxY1, fieldWidth, boxHeight);
+            ctx.fillStyle = '#000000';
+            // Center text vertically: box center is at boxY1 + boxHeight/2, adjust for text baseline
+            ctx.fillText(MENU_INPUT_FIELDS.player1 || '...', fieldX + textPadding, boxY1 + boxHeight * 0.75);
+            
+            currentY += fieldSpacing;
+            
+            // Player 2
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Player 2 Name:', labelX, currentY);
+            ctx.fillStyle = MENU_ACTIVE_FIELD === 'player2' ? '#FFD700' : '#FFFFFF';
+            const boxY2 = currentY - boxOffset;
+            ctx.fillRect(fieldX, boxY2, fieldWidth, boxHeight);
+            ctx.fillStyle = '#000000';
+            // Center text vertically: box center is at boxY2 + boxHeight/2, adjust for text baseline
+            ctx.fillText(MENU_INPUT_FIELDS.player2 || '...', fieldX + textPadding, boxY2 + boxHeight * 0.75);
+            
+            currentY += fieldSpacing;
+            
+            // Goal Score
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Goal Score:', labelX, currentY);
+            ctx.fillStyle = MENU_ACTIVE_FIELD === 'goal_score' ? '#FFD700' : '#FFFFFF';
+            const boxY3 = currentY - boxOffset;
+            ctx.fillRect(fieldX, boxY3, fieldWidth, boxHeight);
+            ctx.fillStyle = '#000000';
+            // Center text vertically: box center is at boxY3 + boxHeight/2, adjust for text baseline
+            ctx.fillText(MENU_INPUT_FIELDS.goal_score || '...', fieldX + textPadding, boxY3 + boxHeight * 0.75);
+            
+            currentY += fieldSpacing;
+            
+            // AI Checkbox
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText('Player 2 AI:', labelX, currentY);
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.lineWidth = Math.max(1, Math.floor(3 * scale));
+            const checkboxSize = scaleValue(40);
+            const checkboxOffset = scaleValue(35);
+            ctx.strokeRect(fieldX, currentY - checkboxOffset, checkboxSize, checkboxSize);
+            if (MENU_PLAYER2_AI_ENABLED) {
+                ctx.fillStyle = '#FFD700';
+                const innerSize = scaleValue(30);
+                const innerOffset = scaleValue(5);
+                ctx.fillRect(fieldX + innerOffset, currentY - checkboxOffset + innerOffset, innerSize, innerSize);
+            }
+            
+            // Start button - centered at bottom
+            const buttonWidth = Math.max(scaleValue(400), width * 0.3);
+            const buttonHeight = scaleValue(80);
+            const buttonBottom = scaleValue(150);
+            ctx.fillStyle = '#00FF00';
+            ctx.fillRect(width / 2 - buttonWidth / 2, height - buttonBottom, buttonWidth, buttonHeight);
+            ctx.fillStyle = '#000000';
+            ctx.font = `bold ${scaleFont(50)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText('START GAME', width / 2, height - buttonBottom + buttonHeight * 0.7);
+            ctx.textAlign = 'left';
+        }
+        
+        // ==================== MENU HANDLING ====================
+        function handleMenuKey(event) {
+            if (event.key === 'Tab') {
+                event.preventDefault();
+                const fields = ['player1', 'player2', 'goal_score'];
+                const currentIndex = fields.indexOf(MENU_ACTIVE_FIELD);
+                MENU_ACTIVE_FIELD = fields[(currentIndex + 1) % fields.length];
+            } else if (event.key === 'Enter') {
+                startGame();
+            } else if (event.key === 'Backspace') {
+                if (MENU_ACTIVE_FIELD === 'goal_score') {
+                    MENU_INPUT_FIELDS.goal_score = MENU_INPUT_FIELDS.goal_score.slice(0, -1);
+                } else {
+                    MENU_INPUT_FIELDS[MENU_ACTIVE_FIELD] = MENU_INPUT_FIELDS[MENU_ACTIVE_FIELD].slice(0, -1);
+                }
+            } else if (event.key.length === 1) {
+                if (MENU_ACTIVE_FIELD === 'goal_score') {
+                    if (event.key >= '0' && event.key <= '9') {
+                        MENU_INPUT_FIELDS.goal_score += event.key;
+                    }
+                } else {
+                    MENU_INPUT_FIELDS[MENU_ACTIVE_FIELD] += event.key;
+                }
+            }
+        }
+        
+        function handleMenuClick(x, y) {
+            const scale = getScale();
+            const menuCenterX = width / 2;
+            const menuStartY = height * 0.3;
+            const fieldSpacing = scaleValue(100);
+            const fieldWidth = Math.min(scaleValue(400), width * 0.3);
+            const labelWidth = scaleValue(250);
+            const labelGap = scaleValue(200);
+            
+            // Calculate positions to match drawMenu
+            const totalWidth = labelWidth + labelGap + fieldWidth;
+            const groupLeft = menuCenterX - totalWidth / 2;
+            const labelX = groupLeft;
+            const fieldX = groupLeft + labelWidth + labelGap;
+            
+            // Check field clicks
+            const fieldY1 = menuStartY;
+            const fieldY2 = menuStartY + fieldSpacing;
+            const fieldY3 = menuStartY + fieldSpacing * 2;
+            const fieldY4 = menuStartY + fieldSpacing * 3;
+            const boxOffset = scaleValue(40);
+            const boxHeight = scaleValue(60);
+            
+            // Check input field clicks
+            if (x >= fieldX && x <= fieldX + fieldWidth) {
+                if (y >= fieldY1 - boxOffset && y <= fieldY1 - boxOffset + boxHeight) {
+                    MENU_ACTIVE_FIELD = 'player1';
+                } else if (y >= fieldY2 - boxOffset && y <= fieldY2 - boxOffset + boxHeight) {
+                    MENU_ACTIVE_FIELD = 'player2';
+                } else if (y >= fieldY3 - boxOffset && y <= fieldY3 - boxOffset + boxHeight) {
+                    MENU_ACTIVE_FIELD = 'goal_score';
+                }
+            }
+            
+            // Check checkbox click
+            const checkboxSize = scaleValue(40);
+            const checkboxOffset = scaleValue(35);
+            if (x >= fieldX && x <= fieldX + checkboxSize && y >= fieldY4 - checkboxOffset && y <= fieldY4 - checkboxOffset + checkboxSize) {
+                MENU_PLAYER2_AI_ENABLED = !MENU_PLAYER2_AI_ENABLED;
+            }
+            
+            // Check start button
+            const buttonWidth = Math.max(scaleValue(400), width * 0.3);
+            const buttonHeight = scaleValue(80);
+            const buttonBottom = scaleValue(150);
+            const buttonLeft = width / 2 - buttonWidth / 2;
+            const buttonRight = width / 2 + buttonWidth / 2;
+            if (x >= buttonLeft && x <= buttonRight && y >= height - buttonBottom && y <= height - buttonBottom + buttonHeight) {
+                startGame();
+            }
+        }
+        
+        function startGame() {
+            if (!MENU_INPUT_FIELDS.player1 || !MENU_INPUT_FIELDS.player2) return;
+            
+            PLAYERS = [MENU_INPUT_FIELDS.player1, MENU_INPUT_FIELDS.player2];
+            PLAYER_GOAL = parseInt(MENU_INPUT_FIELDS.goal_score) || 2000;
+            
+            diceRow = createStartingDice();
+            currentPlayerIndex = Math.floor(Math.random() * PLAYERS.length);
+            playerStats = {};
+            playerBankedGroups = {};
+            for (const player of PLAYERS) {
+                playerStats[player] = {
+                    gamePoints: 0,
+                    bankedPoints: 0,
+                    selectedScore: 0,
+                    displayedBankedPoints: 0
+                };
+                playerBankedGroups[player] = [];
+            }
+            testInputValues = diceRow.map(d => d.value);
+            
+            AI_ACTIVE = false;
+            AI_THINKING = false;
+            AI_ACTION_QUEUE = [];
+            AI_MOUSE_POS = null;
+            AI_TARGET_POS = null;
+            AI_CLICK_PENDING = false;
+            AI_LAST_CLICK_TIME = 0;
+            AI_BANK_AND_PASS_PENDING = false;
+            AI_BANK_AND_PASS_TIME = 0;
+            
+            checkForBust();
+            turnOverlayActive = true;
+            turnOverlayStartTime = Date.now();
+            MENU_ACTIVE = false;
+            
+            // Broadcast initial game state in Discord multiplayer
+            if (isDiscordMultiplayer && isHost) {
+                setTimeout(() => {
+                    broadcastGameState();
+                }, 100); // Small delay to ensure everything is initialized
+            }
+        }
+        
+        // ==================== INPUT HANDLING ====================
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            if (MENU_ACTIVE) {
+                handleMenuClick(x, y);
+                return;
+            }
+            
+            if (turnOverlayActive || bustOverlayActive || gameWon) return;
+            
+            // In Discord multiplayer, only host can act (for now)
+            // TODO: Improve to allow both players to act on their turn
+            if (isDiscordMultiplayer && !isHost) {
+                return; // Non-host players can only observe in current implementation
+            }
+            
+            const aiShouldControl = (currentPlayerIndex === 1 && MENU_PLAYER2_AI_ENABLED &&
+                !turnOverlayActive && !bustOverlayActive && !gameWon && !testInputActive);
+            if (aiShouldControl) return;
+            
+            for (let i = 0; i < diceRow.length; i++) {
+                const dice = diceRow[i];
+                if (dice.containsPoint([x, y])) {
+                    dice.selected = !dice.selected;
+                    updateSelectedScore();
+                    
+                    // Broadcast dice selection in Discord multiplayer
+                    if (isDiscordMultiplayer && isHost) {
+                        broadcastAction({
+                            type: 'dice_select',
+                            diceIndex: i,
+                            selected: dice.selected,
+                            playerIndex: currentPlayerIndex
+                        });
+                    }
+                    break;
+                }
+            }
+        });
+        
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            realMousePos = [x, y];
+            
+            if (MENU_ACTIVE) return;
+            
+            const mousePos = AI_ACTIVE && AI_MOUSE_POS ? AI_MOUSE_POS : [x, y];
+            for (const dice of diceRow) {
+                dice.isHovered = dice.containsPoint(mousePos);
+            }
+        });
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                if (MENU_ACTIVE) {
+                    // Could close window, but browser security prevents this
+                    return;
+                }
+                if (testInputActive) {
+                    testInputActive = false;
+                    return;
+                }
+                MENU_ACTIVE = true;
+                gameWon = false;
+                winner = null;
+                return;
+            }
+            
+            if (MENU_ACTIVE) {
+                handleMenuKey(e);
+                return;
+            }
+            
+            if (e.key === 'r' || e.key === 'R') {
+                rulesOverlayActive = !rulesOverlayActive;
+                rulesScrollOffset = 0; // Reset scroll when opening/closing
+                return;
+            }
+            
+            if (e.key === 'p' || e.key === 'P') {
+                // Flash screen - works even in menu or overlays, and for all players
+                triggerFlash();
+                return;
+            }
+            
+            if (turnOverlayActive && e.key) {
+                // Only allow dismissal after minimum duration
+                const currentTime = Date.now();
+                if (currentTime - turnOverlayStartTime >= TURN_OVERLAY_MIN_DURATION) {
+                    turnOverlayActive = false;
+                }
+                return;
+            }
+            
+            if (gameWon && e.key === ' ') {
+                gameWon = false;
+                winner = null;
+                MENU_ACTIVE = true;
+                return;
+            }
+            
+            if (turnOverlayActive || bustOverlayActive || gameWon) return;
+            
+            // In Discord multiplayer, only host can act (for now)
+            if (isDiscordMultiplayer && !isHost) {
+                return; // Non-host players can only observe in current implementation
+            }
+            
+            const aiShouldControl = (currentPlayerIndex === 1 && MENU_PLAYER2_AI_ENABLED &&
+                !turnOverlayActive && !bustOverlayActive && !gameWon && !testInputActive);
+            if (aiShouldControl) return;
+            
+            if (e.key === 'f' || e.key === 'F') {
+                bankSelectedDice();
+            } else if (e.key === 'q' || e.key === 'Q') {
+                e.preventDefault();
+                if (!qKeyHeld) {
+                    qKeyHeld = true;
+                    qKeyPressTime = Date.now();
+                    qKeyActionExecuted = false;
+                }
+            }
+        });
+        
+        document.addEventListener('keyup', (e) => {
+            if (e.key === 'q' || e.key === 'Q') {
+                e.preventDefault();
+                qKeyHeld = false;
+                qKeyActionExecuted = false;
+            }
+        });
+        
+        // Also handle window blur to reset key state
+        window.addEventListener('blur', () => {
+            qKeyHeld = false;
+            qKeyActionExecuted = false;
+        });
+        
+        // ==================== GAME LOOP ====================
+        let lastTime = Date.now();
+        
+        function gameLoop() {
+            try {
+                const currentTime = Date.now();
+                const dt = (currentTime - lastTime) / 1000;
+                lastTime = currentTime;
+            
+            // Update flash timing
+            if (flashActive) {
+                if (currentTime - flashStartTime >= FLASH_DURATION) {
+                    flashActive = false;
+                }
+            }
+            
+            if (!MENU_ACTIVE) {
+                aiUpdate();
+                
+                if (gameWon) {
+                    updateCelebration(dt);
+                }
+                
+                if (turnOverlayActive) {
+                    if (currentTime - turnOverlayStartTime >= TURN_OVERLAY_DURATION) {
+                        turnOverlayActive = false;
+                    }
+                }
+                
+                if (bustOverlayActive) {
+                    if (currentTime - bustOverlayStartTime >= BUST_OVERLAY_DURATION) {
+                        completeBust();
+                    }
+                }
+                
+                if (qKeyHeld && !turnOverlayActive && !bustOverlayActive && !testInputActive && !gameWon && !qKeyActionExecuted) {
+                    const elapsed = currentTime - qKeyPressTime;
+                    if (elapsed >= HOLD_DURATION) {
+                        console.log('Q key held for duration, executing bankAndPassTurn. Elapsed:', elapsed);
+                        qKeyActionExecuted = true;
+                        // Execute immediately - don't wait for keyup
+                        bankAndPassTurn();
+                    }
+                }
+            }
+            
+            // Drawing
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, width, height);
+            
+            if (MENU_ACTIVE) {
+                drawMenu(ctx);
+                if (rulesOverlayActive) {
+                    drawRulesOverlay(ctx);
+                }
+            } else {
+                if (gameWon) {
+                    drawWinOverlay(ctx);
+                    drawCelebration(ctx);
+                } else if (turnOverlayActive) {
+                    drawTurnOverlay(ctx);
+                } else {
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.font = `${scaleFont(120)}px Arial`;
+                    ctx.textAlign = 'center';
+                    ctx.fillText(`${PLAYERS[currentPlayerIndex]}'s Turn`, width / 2, height * 0.12);
+                    ctx.textAlign = 'left';
+                    
+                    drawScoreboard(ctx);
+                    for (const dice of diceRow) {
+                        dice.draw(ctx);
+                    }
+                    drawGameControls(ctx);
+                    
+                    if (bustOverlayActive) {
+                        drawBustMessage(ctx);
+                    }
+                    drawPassProgressDoughnut(ctx);
+                }
+                
+                if (rulesOverlayActive) {
+                    drawRulesOverlay(ctx);
+                }
+                
+                // Draw fake cursor on top of everything
+                drawFakeCursor(ctx);
+            }
+            
+            // Draw flash overlay on top of everything
+            if (flashActive) {
+                const elapsed = currentTime - flashStartTime;
+                const progress = Math.min(elapsed / FLASH_DURATION, 1);
+                // Fade out over the duration
+                const alpha = 1 - progress;
+                ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+                ctx.fillRect(0, 0, width, height);
+            }
+            
+            requestAnimationFrame(gameLoop);
+            } catch (error) {
+                console.error('Game loop error:', error);
+                // Continue the loop even if there's an error
+                requestAnimationFrame(gameLoop);
+            }
+        }
+        
+        // Start the game loop
+        try {
+            gameLoop();
+        } catch (error) {
+            console.error('Failed to start game loop:', error);
+        }
+    </script>
+</body>
+</html>
